@@ -257,6 +257,34 @@ def get_adjustments(days_back: int = 365) -> list:
     return adjustments
 
 
+def get_today_trade_count() -> int:
+    """Return the number of trades opened today."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    today = datetime.now().date().isoformat()
+    cursor.execute(
+        "SELECT COUNT(*) as total FROM trades WHERE DATE(entry_date) = ?",
+        (today,)
+    )
+    result = cursor.fetchone()
+    conn.close()
+    return int(result[0] if result else 0)
+
+
+def get_today_realized_pnl() -> float:
+    """Return today's realized P/L from closed trades."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    today = datetime.now().date().isoformat()
+    cursor.execute(
+        "SELECT SUM(pnl_dollars) as total FROM trades WHERE DATE(exit_date) = ? AND status != 'OPEN'",
+        (today,)
+    )
+    result = cursor.fetchone()
+    conn.close()
+    return float(result[0] or 0.0)
+
+
 # ─────────────────────────────────────────────────────────────
 # MISTAKE TRACKING
 # ─────────────────────────────────────────────────────────────

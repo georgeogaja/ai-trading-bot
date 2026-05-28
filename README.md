@@ -29,13 +29,14 @@ pip install -r requirements.txt
 
 ### Step 3: Set up API keys
 ```bash
-cp .env.template .env
+copy .env.example .env
 # Edit .env with your actual API keys
 ```
 
 **Get your keys:**
 - Alpaca (paper): https://app.alpaca.markets/paper-trading → API Keys
 - Claude API: https://console.anthropic.com/ → API Keys
+- Discord webhook: https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks (optional)
 
 ### Step 4: Run in paper mode (ALWAYS START HERE)
 ```bash
@@ -62,13 +63,12 @@ george_trading_bot/
 ├── orchestrator.py          ← MAIN CONTROLLER (run this)
 ├── config.py                ← ALL strategy settings
 ├── requirements.txt         ← Python dependencies
-├── .env.template            ← API key template
-│
-├── agents/
-│   ├── market_intelligence.py  ← News scanning + watchlist building
-│   ├── strategy_engine.py      ← George's ThinkorSwim signal logic
-│   ├── trade_executor.py       ← Alpaca order placement
-│   └── learning_engine.py      ← Mistake tracking + weekly reports
+├── .env.example             ← Environment variable template (do not commit)
+├── alpaca_broker.py         ← Alpaca paper broker abstraction
+├── market_intelligence.py    ← News scanning + watchlist building
+├── strategy_engine.py        ← George's ThinkorSwim signal logic
+├── trade_executor.py         ← Alpaca order placement
+└── learning_engine.py        ← Mistake tracking + weekly reports
 │
 ├── database/
 │   ├── db.py                ← SQLite database functions
@@ -116,7 +116,8 @@ george_trading_bot/
 ### Phase 1: PAPER TRADING (First 30+ days)
 ```
 PAPER_TRADING=true in .env
-Bot trades with fake money
+ALPACA_BASE_URL=https://paper-api.alpaca.markets
+Bot trades with fake money only
 Review performance weekly
 DO NOT go live until win rate > 55%
 ```
@@ -186,6 +187,25 @@ Before the bot can trade options, you need Level 2 options approval on Alpaca:
 2. Go to Account → Trading → Options
 3. Apply for Level 2 (covers buying calls and puts)
 4. Approval usually takes 1–2 business days
+
+## Alpaca Paper-Only Architecture
+
+This bot is designed to use Alpaca paper trading by default. The following variables are required in `.env`:
+- `ALPACA_API_KEY`
+- `ALPACA_SECRET_KEY`
+- `ALPACA_BASE_URL=https://paper-api.alpaca.markets`
+- `PAPER_TRADING=true`
+
+If you manually set `PAPER_TRADING=false`, the bot will allow live execution, but live mode is not recommended until you have proven performance in paper trading.
+
+The bot now includes:
+- account balance checks
+- buying power validation
+- option order placement via Alpaca paper API
+- open position tracking
+- stop loss and take profit auto exits in paper trading
+- Discord notifications for trade entries and exits
+- a daily kill switch for max loss and max trades
 
 ---
 

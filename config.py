@@ -3,6 +3,11 @@ config.py — George's Trading Bot Configuration
 All strategy parameters, rules, and constants in one place.
 """
 
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # ─────────────────────────────────────────────────────────────
 # ACCOUNT CONFIGURATION
 # ─────────────────────────────────────────────────────────────
@@ -12,7 +17,13 @@ ACCOUNT = {
     "max_open_positions":   5,         # Never more than 5 concurrent positions
     "reserve_cash_pct":     0.30,      # Always keep 30% cash reserve = $3,000
     "paper_trading":        True,      # ALWAYS start in paper mode
+    "kill_switch_enabled":  True,      # Enable daily loss and trade count protection
+    "max_daily_loss_usd":   500,       # Stop new trades after this much realized loss in a day
+    "max_trades_per_day":   5,         # Stop new trades after this many fills in a day
 }
+
+# Override PAPER_TRADING from .env when explicitly set
+ACCOUNT["paper_trading"] = os.getenv("PAPER_TRADING", str(ACCOUNT["paper_trading"]).lower()).lower() == "true"
 
 # ─────────────────────────────────────────────────────────────
 # GEORGE'S HARD RULES (NEVER VIOLATE — SYSTEM WILL REJECT)

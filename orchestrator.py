@@ -37,7 +37,7 @@ from database.db import initialize_database
 from market_intelligence import run_market_intelligence, get_macro_data
 from strategy_engine import run_full_scan, analyze_stock
 from trade_executor import (
-    get_account_status, place_options_trade, monitor_open_positions
+    get_account_status, place_options_trade, monitor_open_positions, is_kill_switch_engaged
 )
 from learning_engine import (
     generate_weekly_report, get_mistake_patterns, self_adjust_thresholds, load_adjustments
@@ -118,8 +118,14 @@ def task_morning_scan():
 
         logger.info(f"💰 Account: ${account['portfolio_value']:.2f} | "
                     f"Cash: ${account['cash']:.2f} | "
+                    f"Buying Power: ${account['buying_power']:.2f} | "
                     f"Positions: {account['open_positions']}")
         logger.info(f"📊 Macro: {macro.get('signal')} | Oil: ${macro.get('oil')} | VIX: {macro.get('vix')}")
+
+        kill_switch_active, kill_reason = is_kill_switch_engaged()
+        if kill_switch_active:
+            logger.warning(f"⛔ Kill switch engaged — no new trades today: {kill_reason}")
+            return
 
         # Don't trade in RED macro
         if macro.get("signal") == "RED":
