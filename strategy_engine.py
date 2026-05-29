@@ -421,13 +421,23 @@ def get_claude_trade_plan(symbol: str, technical: dict, macro: dict,
                            account_info: dict) -> dict:
     """
     Sends full context to Claude and gets a complete trade plan.
-    Claude applies George's strategy and recent mistake patterns
-    to make the final decision.
+    Claude applies George's strategy, recent mistake patterns, and
+    optional live Perplexity research to make the final decision.
     """
 
     # Get recent mistake patterns to inform the decision
     mistakes = get_mistake_patterns(days_back=30)
     mistake_summary = json.dumps(mistakes, indent=2)
+
+    # Optional Perplexity research enrichment — fail-safe, never blocks execution
+    research_context = "Not available (PERPLEXITY_API_KEY not configured or research failed)."
+    try:
+        from ai_research import research_symbol
+        research = research_symbol(symbol)
+        if research.get("summary"):
+            research_context = research["summary"][:800]
+    except Exception as exc:
+        logger.debug(f"Perplexity research unavailable for {symbol}: {exc}")
 
     prompt = f"""
 You are George's autonomous AI trading agent. You manage a $10,000 swing options account
@@ -514,6 +524,11 @@ Open Positions: {account_info.get('open_positions', 0)}
 Portfolio Value: ${account_info.get('portfolio_value', 0):.2f}
 
 ═══════════════════════════════════════════════════
+LIVE RESEARCH & CATALYST CONTEXT (Perplexity AI)
+═══════════════════════════════════════════════════
+{research_context}
+
+═══════════════════════════════════════════════════
 DECISION REQUIRED
 ═══════════════════════════════════════════════════
 Based on ALL the above, should we place a trade?
@@ -545,7 +560,7 @@ RESPOND WITH VALID JSON ONLY:
 """
 
     response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=1500,
         messages=[{"role": "user", "content": prompt}]
     )

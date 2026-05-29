@@ -1,16 +1,14 @@
 """Watch manager: activates temporary higher-frequency monitoring for candidate tickers.
 
-This module exposes functions to activate/deactivate watch mode and a research cache
-for Perplexity results with a 6-hour TTL.
+This module exposes functions for watch-mode activation logic and research caching.
+Perplexity research is fetched via ai_research.research_symbol, which uses the correct
+OpenAI-compatible endpoint and handles DB caching internally.
 """
-import os
-import json
-import requests
 from datetime import datetime, timedelta
 from loguru import logger
 from typing import Dict, Any
 
-from db import get_research_cache, save_research_cache
+from db import get_research_cache
 
 _research_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -50,79 +48,41 @@ def build_research_query(symbol: str, technical: dict, macro: dict) -> str:
     return query
 
 
-def fetch_perplexity_research(query: str) -> dict:
-    api_key = os.getenv("PERPLEXITY_API_KEY")
-    api_url = os.getenv("PERPLEXITY_API_URL", "https://www.perplexity.ai/api/search")
-    if not api_key:
-        logger.warning("Perplexity API key missing; skipping external research call.")
-        return {
-            "summary": "Perplexity research unavailable (PERPLEXITY_API_KEY not configured).",
-            "details": [],
-        }
-
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": api_key,
-    }
-    payload = {
-        "query": query,
-        "source": "api",
-        "top_k": 3,
-    }
-
-    try:
-        response = requests.post(api_url, headers=headers, json=payload, timeout=20)
-        response.raise_for_status()
-        data = response.json()
-        return {
-            "summary": data.get("summary") or data.get("answer") or "Perplexity research returned no summary.",
-            "raw": data,
-        }
-    except Exception as exc:
-        logger.warning(f"Perplexity request failed: {exc}")
-        return {
-            "summary": "Perplexity research failed or returned invalid response.",
-            "details": [],
-        }
-
-
 def research_top_candidates(candidates: list, macro: dict, limit: int = 3) -> list:
-    """Run or reuse cached research for the best candidate setups."""
+    """Fetch or reuse cached Perplexity research for the top candidate setups.
+
+    Delegates to ai_research.research_symbol, which uses the correct
+    OpenAI-compatible Perplexity endpoint and handles DB caching internally.
+    Returns {} per symbol on any failure — never raises.
+    """
     if not candidates:
         return []
 
-    sorted_candidates = sorted(
+    top_candidates = sorted(
         candidates,
         key=lambda item: float(item.get("confidence", 0) or 0),
         reverse=True,
-    )
-    top_candidates = sorted_candidates[:limit]
-    results = []
+    )[:limit]
 
+    results = []
     for candidate in top_candidates:
         symbol = candidate.get("symbol")
         if not symbol:
             continue
 
-        cached = get_research_cache(symbol)
-        if cached:
-            logger.info(f"Research cache HIT for {symbol}")
-            results.append({
-                "symbol": symbol,
-                "cached": True,
-                "research": cached,
-            })
-            continue
+        # Check DB before calling to preserve accurate cached/fresh flag for logging
+        was_cached = bool(get_research_cache(symbol))
 
-        query = build_research_query(symbol, candidate.get("technical", {}), macro)
-        research = fetch_perplexity_research(query)
-        save_research_cache(symbol, query, "perplexity", research, ttl_hours=6)
-        results.append({
-            "symbol": symbol,
-            "cached": False,
-            "research": research,
-        })
-        logger.info(f"Research cache MISS for {symbol} — stored new result")
+        try:
+            from ai_research import research_symbol
+            research = research_symbol(symbol)
+        except Exception as exc:
+            logger.warning(f"Research unavailable for {symbol}: {exc}")
+            research = {}
+
+        status = "HIT" if was_cached else ("FETCHED" if research else "UNAVAILABLE")
+        logger.info(f"Research {status} for {symbol}")
+        results.append({"symbol": symbol, "cached": was_cached, "research": research})
 
     return results
 
