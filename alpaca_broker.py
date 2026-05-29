@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOptionContractsRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, ContractType
-from database.db import get_today_trade_count, get_today_realized_pnl
+from db import get_today_trade_count, get_today_realized_pnl
 from config import ACCOUNT
 
 load_dotenv()
@@ -29,16 +29,16 @@ def get_alpaca_client() -> TradingClient:
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
         raise RuntimeError("Missing ALPACA_API_KEY or ALPACA_SECRET_KEY in .env")
 
-    base_url = ALPACA_BASE_URL
-    if PAPER_TRADING and "paper-api.alpaca.markets" not in base_url:
-        logger.warning("Paper trading enabled but ALPACA_BASE_URL is not a paper endpoint. Overriding to paper URL.")
-        base_url = "https://paper-api.alpaca.markets"
+    if PAPER_TRADING and "paper-api.alpaca.markets" not in ALPACA_BASE_URL:
+        logger.warning(
+            "Paper trading enabled but ALPACA_BASE_URL is not a paper endpoint. "
+            "Please set ALPACA_BASE_URL=https://paper-api.alpaca.markets in .env."
+        )
 
     return TradingClient(
         ALPACA_API_KEY,
         ALPACA_SECRET_KEY,
         paper=PAPER_TRADING,
-        base_url=base_url,
     )
 
 
@@ -60,13 +60,17 @@ def send_discord_notification(message: str) -> bool:
 
 
 def get_account_status() -> dict:
-    """Return Alpaca account balances, buying power, and open position count."""
+    """Return Alpaca account balances, buying power, and open position count.
+    
+    Returns dict with 'error' field if account fetch fails.
+    """
     try:
         client = get_alpaca_client()
         account = client.get_account()
         positions = client.get_all_positions()
 
         return {
+            "account_status": account.status,
             "cash": float(account.cash),
             "portfolio_value": float(account.portfolio_value),
             "buying_power": float(account.buying_power),
@@ -82,9 +86,11 @@ def get_account_status() -> dict:
                 for p in positions
             ],
             "paper_trading": PAPER_TRADING,
+            "error": None,
         }
     except Exception as e:
-        logger.error(f"Alpaca account status error: {e}")
+        error_msg = f"Failed to fetch Alpaca account status: {e}"
+        logger.error(f"❌ {error_msg}")
         return {
             "cash": 0,
             "portfolio_value": 0,
@@ -92,6 +98,7 @@ def get_account_status() -> dict:
             "open_positions": 0,
             "positions": [],
             "paper_trading": PAPER_TRADING,
+            "error": error_msg,
         }
 
 

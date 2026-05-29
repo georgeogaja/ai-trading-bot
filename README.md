@@ -53,6 +53,10 @@ python orchestrator.py --scan
 python orchestrator.py --report
 ```
 
+### Runner Tracking
+The bot now includes runner tracking for swing options positions that remain after partial profit taking.
+Use `show_active_runners()` in the codebase to review active runners and their stop, target, and days-to-expiration.
+
 ---
 
 ## Project Structure
@@ -204,8 +208,8 @@ The bot now includes:
 - option order placement via Alpaca paper API
 - open position tracking
 - stop loss and take profit auto exits in paper trading
-- Discord notifications for trade entries and exits
-- a daily kill switch for max loss and max trades
+- Discord notifications for trade entries and exits- Runner tracking for residual swing options positions after partial profit taking
+- Active runner summary and risk-managed runner lifecycle alerts- a daily kill switch for max loss and max trades
 
 ---
 

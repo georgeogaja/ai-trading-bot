@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from anthropic import Anthropic
 from loguru import logger
 from config import HARD_RULES, SIGNAL_WEIGHTS
-from database.db import (
+from db import (
     get_mistake_patterns, calculate_weekly_performance,
     get_open_trades, get_connection, get_trade_by_id, get_adjustments, log_mistake
 )

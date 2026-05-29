@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from anthropic import Anthropic
 from loguru import logger
 from config import SECTORS, CORE_WATCHLIST, MACRO
-from database.db import add_to_watchlist, log_macro
+from db import add_to_watchlist, log_macro
 
 # Top financial RSS feeds (free, no API key needed)
 NEWS_FEEDS = [

@@ -75,6 +75,32 @@ def initialize_database():
         notes               TEXT
     )""")
 
+    # ── RUNNERS ───────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS runners (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        trade_id                INTEGER,
+        symbol                  TEXT NOT NULL,
+        option_symbol           TEXT,
+        option_type             TEXT,
+        entry_date              TEXT NOT NULL,
+        original_contracts      INTEGER NOT NULL,
+        contracts_sold          INTEGER NOT NULL,
+        contracts_remaining     INTEGER NOT NULL,
+        entry_option_price      REAL,
+        current_option_price    REAL,
+        realized_pnl            REAL,
+        unrealized_pnl          REAL,
+        runner_stop_price       REAL,
+        runner_target_price     REAL,
+        expiration_date         TEXT,
+        days_to_expiration      INTEGER,
+        status                  TEXT DEFAULT 'active_runner', -- 'active_runner' | 'closed_runner'
+        reason_still_holding    TEXT,
+        notes                   TEXT,
+        FOREIGN KEY(trade_id) REFERENCES trades(id)
+    )""")
+
     # ── MISTAKES ──────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS mistakes (
@@ -166,6 +192,18 @@ def initialize_database():
         reason      TEXT
     )""")
 
+    # ── RESEARCH CACHE ─────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS research_cache (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol          TEXT NOT NULL,
+        query           TEXT,
+        source          TEXT,
+        data            TEXT,
+        created_at      TEXT NOT NULL,
+        expires_at      TEXT NOT NULL
+    )""")
+
     conn.commit()
     conn.close()
     logger.info("✅ Database initialized successfully")
@@ -207,9 +245,11 @@ def update_trade_exit(trade_id: int, exit_data: dict):
     if trade:
         entry_price = trade['entry_option_price']
         exit_price = exit_data.get('exit_option_price', 0)
-        contracts = trade['contracts']
+        contracts = int(exit_data.get('contracts', trade['contracts']) or trade['contracts'] or 1)
         pnl = (exit_price - entry_price) * 100 * contracts
-        pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+        pnl_pct = 0.0
+        if entry_price:
+            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
         exit_data['pnl_dollars'] = pnl
         exit_data['pnl_pct'] = pnl_pct
 
@@ -231,6 +271,85 @@ def get_open_trades():
     trades = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return trades
+
+
+def get_active_runners() -> list:
+    """Return all active runner records."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM runners WHERE status = 'active_runner'")
+    runners = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return runners
+
+
+def show_active_runners() -> list:
+    """Return a summary of active runners for review."""
+    active = get_active_runners()
+    summary = []
+    for runner in active:
+        entry = runner.get('entry_option_price') or 0.0
+        current = runner.get('current_option_price') or 0.0
+        percent = 0.0
+        if entry:
+            percent = ((current - entry) / entry) * 100
+        summary.append({
+            'id': runner.get('id'),
+            'symbol': runner.get('symbol'),
+            'contracts_remaining': runner.get('contracts_remaining'),
+            'entry_premium': entry,
+            'current_premium': current,
+            'percent_gain_loss': round(percent, 1),
+            'stop_level': runner.get('runner_stop_price'),
+            'target': runner.get('runner_target_price'),
+            'expiration_date': runner.get('expiration_date'),
+            'days_to_expiration': runner.get('days_to_expiration'),
+            'reason_still_holding': runner.get('reason_still_holding'),
+            'status': runner.get('status'),
+        })
+    return summary
+
+
+def log_runner_entry(runner_data: dict) -> int:
+    """Create a new runner record after partial profit is taken."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    runner_data['entry_date'] = datetime.now().isoformat()
+    runner_data['status'] = 'active_runner'
+
+    columns = ', '.join(runner_data.keys())
+    placeholders = ', '.join(['?' for _ in runner_data])
+    cursor.execute(
+        f"INSERT INTO runners ({columns}) VALUES ({placeholders})",
+        list(runner_data.values())
+    )
+    runner_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    logger.info(f"🏃 Runner logged: {runner_data.get('symbol')} | Runner ID: {runner_id}")
+    return runner_id
+
+
+def update_runner(runner_id: int, update_data: dict):
+    """Update an active runner record."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    set_clause = ', '.join([f"{k} = ?" for k in update_data.keys()])
+    cursor.execute(
+        f"UPDATE runners SET {set_clause} WHERE id = ?",
+        list(update_data.values()) + [runner_id]
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"🔄 Runner {runner_id} updated")
+
+
+def close_runner(runner_id: int, close_data: dict = None):
+    """Close a runner and mark it as closed_runner."""
+    if close_data is None:
+        close_data = {}
+    close_data['status'] = 'closed_runner'
+    update_runner(runner_id, close_data)
 
 
 def get_trade_by_id(trade_id: int) -> dict:
@@ -394,12 +513,73 @@ def get_active_watchlist() -> list:
     return items
 
 
+def get_research_cache(symbol: str) -> dict:
+    """Return cached research for a symbol if still valid."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM research_cache WHERE symbol = ? ORDER BY expires_at DESC LIMIT 1",
+        (symbol,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return {}
+
+    expires_at = datetime.fromisoformat(row["expires_at"])
+    if datetime.now() >= expires_at:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM research_cache WHERE id = ?", (row["id"],))
+        conn.commit()
+        conn.close()
+        return {}
+
+    return {
+        "symbol": row["symbol"],
+        "query": row["query"],
+        "source": row["source"],
+        "data": json.loads(row["data"]),
+        "created_at": row["created_at"],
+        "expires_at": row["expires_at"],
+    }
+
+
+def save_research_cache(symbol: str, query: str, source: str, data: dict, ttl_hours: int = 6):
+    """Save research results to the local cache database."""
+    expires_at = (datetime.now() + timedelta(hours=ttl_hours)).isoformat()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO research_cache (symbol, query, source, data, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            symbol,
+            query,
+            source,
+            json.dumps(data),
+            datetime.now().isoformat(),
+            expires_at,
+        )
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"🧠 Research cache saved for {symbol} (expires {expires_at})")
+
+
+def delete_expired_research_cache():
+    """Delete expired research cache entries."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM research_cache WHERE expires_at <= ?", (datetime.now().isoformat(),))
+    conn.commit()
+    conn.close()
+
+
 def add_to_watchlist(symbol: str, source: str, sector: str, reason: str, headline: str = None):
     """Add a stock to the dynamic watchlist."""
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Check if already active
     cursor.execute(
         "SELECT id FROM watchlist WHERE symbol = ? AND is_active = 1",
         (symbol,)
@@ -415,6 +595,53 @@ def add_to_watchlist(symbol: str, source: str, sector: str, reason: str, headlin
     conn.commit()
     conn.close()
     logger.info(f"📋 Added to watchlist: {symbol} | Source: {source} | Reason: {reason[:50]}")
+
+
+def log_signal(signal_data: dict):
+    """Log scan signal details for later review and analytics."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO signals_log (date, symbol, signal, bull_score, bear_score, rsi, adx, bias, acted_on, reason_skipped) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            signal_data.get('date', datetime.now().isoformat()),
+            signal_data.get('symbol'),
+            signal_data.get('signal'),
+            signal_data.get('bull_score'),
+            signal_data.get('bear_score'),
+            signal_data.get('rsi'),
+            signal_data.get('adx'),
+            signal_data.get('bias'),
+            int(signal_data.get('acted_on', 0)),
+            signal_data.get('reason_skipped'),
+        )
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"🧭 Logged signal: {signal_data.get('symbol')} | {signal_data.get('signal')}")
+
+
+def log_macro(data: dict):
+    """Log macro market conditions used by the bot."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO macro_log (date, oil_price, vix, ten_yr_yield, sp500, macro_signal, iran_status, hormuz_status, summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            data.get('date', datetime.now().isoformat()),
+            data.get('oil_price'),
+            data.get('vix'),
+            data.get('ten_yr_yield'),
+            data.get('sp500'),
+            data.get('macro_signal'),
+            data.get('iran_status'),
+            data.get('hormuz_status'),
+            data.get('summary'),
+        )
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"📈 Logged macro conditions: {data.get('macro_signal', 'N/A')}")
 
 
 def remove_from_watchlist(symbol: str, reason: str):

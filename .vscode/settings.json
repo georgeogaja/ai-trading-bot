@@ -1,0 +1,12 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python main\\.py --now$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python -m py_compile db\\.py watch_manager\\.py scheduler\\.py trade_executor\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

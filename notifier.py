@@ -1,0 +1,315 @@
+"""Discord webhook notifier for George's trading bot.
+
+Uses Discord embeds for clean, professional swing options alerts.
+"""
+import os
+from datetime import datetime, timezone
+
+import requests
+from loguru import logger
+
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+
+COLOR_GREEN = 0x2ecc71
+COLOR_RED = 0xe74c3c
+COLOR_BLUE = 0x3498db
+COLOR_GREY = 0x95a5a6
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _build_embed(title: str, description: str = None, fields: list[dict] = None, color: int = COLOR_BLUE) -> dict:
+    embed = {
+        "title": title,
+        "type": "rich",
+        "color": color,
+        "timestamp": _utc_timestamp(),
+        "footer": {"text": "Paper trading only"},
+    }
+    if description:
+        embed["description"] = description
+    if fields:
+        embed["fields"] = fields
+    return embed
+
+
+def _send_discord(payload: dict) -> bool:
+    if not DISCORD_WEBHOOK_URL:
+        logger.warning("Discord webhook not configured, skipping notification")
+        return False
+
+    try:
+        response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        response.raise_for_status()
+        logger.info("Discord notification sent")
+        return True
+    except Exception as exc:
+        logger.warning(f"Discord webhook failed: {exc}")
+        return False
+
+
+def send_discord_message(message: str) -> bool:
+    embed = _build_embed("Swing Options Bot Notification", description=message, color=COLOR_GREY)
+    return _send_discord({"embeds": [embed]})
+
+
+def notify_watch_mode(
+    symbol: str,
+    direction: str,
+    confidence: float | int,
+    expiration_window: str,
+    strike_preference: str,
+    catalyst: str,
+    technical_setup: str,
+    invalidation_level: str,
+    frequency_minutes: int,
+    note: str = "No trade entered yet. Watching for confirmation.",
+) -> bool:
+    fields = [
+        {"name": "Ticker", "value": symbol, "inline": True},
+        {"name": "Setup Type", "value": "Swing Options", "inline": True},
+        {"name": "Direction", "value": direction, "inline": True},
+        {"name": "Confidence", "value": f"{confidence}/10", "inline": True},
+        {"name": "Expiration Window", "value": expiration_window, "inline": True},
+        {"name": "Strike Preference", "value": strike_preference, "inline": True},
+        {"name": "Catalyst", "value": catalyst or "Not specified", "inline": False},
+        {"name": "Technical Setup", "value": technical_setup or "Trend and momentum confirmation", "inline": False},
+        {"name": "Invalidation Level", "value": invalidation_level or "Set by setup invalidation", "inline": False},
+        {"name": "Monitoring Frequency", "value": f"{frequency_minutes} minutes", "inline": True},
+        {"name": "Status", "value": note, "inline": False},
+    ]
+    embed = _build_embed(
+        f"Watch Mode Activated — {symbol}",
+        description="Swing options watch setup identified. No trade entered yet.",
+        fields=fields,
+        color=COLOR_BLUE,
+    )
+    return _send_discord({"embeds": [embed]})
+
+
+def notify_trade_entered(
+    symbol: str,
+    option_type: str,
+    strike: float,
+    expiry: str,
+    entry_premium: float,
+    stop_loss_premium: float,
+    profit_target_premium: float,
+    max_risk: float,
+    position_size: str,
+    expected_hold: str,
+    reason: str,
+    exit_plan: str,
+) -> bool:
+    fields = [
+        {"name": "Ticker", "value": symbol, "inline": True},
+        {"name": "Option Type", "value": option_type, "inline": True},
+        {"name": "Strike", "value": f"{strike}", "inline": True},
+        {"name": "Expiration", "value": expiry or "Unknown", "inline": True},
+        {"name": "Entry Premium", "value": f"${entry_premium:.2f}", "inline": True},
+        {"name": "Stop Loss Premium", "value": f"${stop_loss_premium:.2f}", "inline": True},
+        {"name": "Profit Target Premium", "value": f"${profit_target_premium:.2f}", "inline": True},
+        {"name": "Max Risk", "value": f"${max_risk:,.2f}", "inline": True},
+        {"name": "Position Size", "value": position_size, "inline": True},
+        {"name": "Expected Hold", "value": expected_hold, "inline": True},
+        {"name": "Reason for Entry", "value": reason or "Confirmed swing setup", "inline": False},
+        {"name": "Exit Plan", "value": exit_plan or "Hold to target or invalidation level", "inline": False},
+    ]
+    embed = _build_embed(
+        f"Trade Entered — {symbol}",
+        description="Paper trade executed for a swing options setup.",
+        fields=fields,
+        color=COLOR_GREEN,
+    )
+    return _send_discord({"embeds": [embed]})
+
+
+def notify_trade_exited(
+    symbol: str,
+    option_type: str,
+    exit_reason: str,
+    entry_premium: float,
+    exit_premium: float,
+    percent_return: float,
+    dollar_pnl: float,
+    lesson: str,
+) -> bool:
+    color = COLOR_GREEN if dollar_pnl >= 0 else COLOR_RED
+    footer_text = "Paper trade closed" if dollar_pnl >= 0 else "Paper trade closed with loss"
+    fields = [
+        {"name": "Ticker", "value": symbol, "inline": True},
+        {"name": "Option Type", "value": option_type, "inline": True},
+        {"name": "Exit Reason", "value": exit_reason, "inline": True},
+        {"name": "Entry Premium", "value": f"${entry_premium:.2f}", "inline": True},
+        {"name": "Exit Premium", "value": f"${exit_premium:.2f}", "inline": True},
+        {"name": "Return", "value": f"{percent_return:.1f}%", "inline": True},
+        {"name": "Dollar P/L", "value": f"${dollar_pnl:,.2f}", "inline": True},
+        {"name": "What Was Learned", "value": lesson or "Review setup and execution details.", "inline": False},
+    ]
+    embed = _build_embed(
+        f"Trade Exited — {symbol}",
+        description="Swing options paper position closed.",
+        fields=fields,
+        color=color,
+    )
+    embed["footer"]["text"] = footer_text
+    return _send_discord({"embeds": [embed]})
+
+
+def notify_risk_blocked(
+    symbol: str,
+    direction: str,
+    reason: str,
+    risk_rule: str,
+    improvement: str,
+) -> bool:
+    fields = [
+        {"name": "Ticker", "value": symbol, "inline": True},
+        {"name": "Setup Direction", "value": direction, "inline": True},
+        {"name": "Blocked Reason", "value": reason, "inline": False},
+        {"name": "Risk Rule Triggered", "value": risk_rule, "inline": False},
+        {"name": "Improvement Needed", "value": improvement or "Tighten setup or reduce risk exposure.", "inline": False},
+    ]
+    embed = _build_embed(
+        f"Risk Blocked — {symbol}",
+        description="Swing options trade blocked by risk controls.",
+        fields=fields,
+        color=COLOR_RED,
+    )
+    return _send_discord({"embeds": [embed]})
+
+
+def notify_runner_created(
+    symbol: str,
+    option_type: str,
+    contracts_remaining: int,
+    entry_premium: float,
+    current_premium: float,
+    runner_stop: float,
+    runner_target: float,
+    days_to_expiration: int,
+    reason_still_holding: str,
+) -> bool:
+    fields = [
+        {"name": "Ticker", "value": symbol, "inline": True},
+        {"name": "Contract", "value": option_type, "inline": True},
+        {"name": "Contracts Remaining", "value": str(contracts_remaining), "inline": True},
+        {"name": "Entry", "value": f"${entry_premium:.2f}", "inline": True},
+        {"name": "Current", "value": f"${current_premium:.2f}", "inline": True},
+        {"name": "Unrealized P/L", "value": f"${current_premium - entry_premium:.2f}", "inline": True},
+        {"name": "Runner Stop", "value": f"${runner_stop:.2f}", "inline": True},
+        {"name": "Runner Target", "value": f"${runner_target:.2f}", "inline": True},
+        {"name": "Days to Expiration", "value": str(days_to_expiration), "inline": True},
+        {"name": "Reason Still Holding", "value": reason_still_holding or "Maintaining runner toward target.", "inline": False},
+    ]
+    embed = _build_embed(
+        "🏃 SWING OPTIONS RUNNER ACTIVE",
+        description="Runner created after partial profit taking.",
+        fields=fields,
+        color=COLOR_BLUE,
+    )
+    return _send_discord({"embeds": [embed]})
+
+
+def notify_runner_stop_moved(
+    symbol: str,
+    option_type: str,
+    runner_stop: float,
+    days_to_expiration: int,
+    reason_still_holding: str,
+) -> bool:
+    fields = [
+        {"name": "Ticker", "value": symbol, "inline": True},
+        {"name": "Contract", "value": option_type, "inline": True},
+        {"name": "Runner Stop", "value": f"${runner_stop:.2f}", "inline": True},
+        {"name": "Days to Expiration", "value": str(days_to_expiration), "inline": True},
+        {"name": "Reason Still Holding", "value": reason_still_holding or "Runner stop moved to protect gains.", "inline": False},
+    ]
+    embed = _build_embed(
+        "🏃 SWING OPTIONS RUNNER STOP MOVED",
+        description="Runner stop level updated to protect the remaining position.",
+        fields=fields,
+        color=COLOR_BLUE,
+    )
+    return _send_discord({"embeds": [embed]})
+
+
+def notify_runner_target_hit(
+    symbol: str,
+    option_type: str,
+    entry_premium: float,
+    exit_premium: float,
+    percent_return: float,
+    dollar_pnl: float,
+    days_to_expiration: int,
+) -> bool:
+    fields = [
+        {"name": "Ticker", "value": symbol, "inline": True},
+        {"name": "Contract", "value": option_type, "inline": True},
+        {"name": "Entry", "value": f"${entry_premium:.2f}", "inline": True},
+        {"name": "Exit", "value": f"${exit_premium:.2f}", "inline": True},
+        {"name": "Percent Gain/Loss", "value": f"{percent_return:.1f}%", "inline": True},
+        {"name": "Dollar P/L", "value": f"${dollar_pnl:,.2f}", "inline": True},
+        {"name": "Days to Expiration", "value": str(days_to_expiration), "inline": True},
+    ]
+    embed = _build_embed(
+        "🏃 SWING OPTIONS RUNNER TARGET HIT",
+        description="Runner target achieved and position is being closed.",
+        fields=fields,
+        color=COLOR_GREEN,
+    )
+    return _send_discord({"embeds": [embed]})
+
+
+def notify_runner_closed(
+    symbol: str,
+    option_type: str,
+    entry_premium: float,
+    exit_premium: float,
+    percent_return: float,
+    dollar_pnl: float,
+    days_to_expiration: int,
+    reason: str,
+) -> bool:
+    fields = [
+        {"name": "Ticker", "value": symbol, "inline": True},
+        {"name": "Contract", "value": option_type, "inline": True},
+        {"name": "Entry", "value": f"${entry_premium:.2f}", "inline": True},
+        {"name": "Exit", "value": f"${exit_premium:.2f}", "inline": True},
+        {"name": "Percent Gain/Loss", "value": f"{percent_return:.1f}%", "inline": True},
+        {"name": "Dollar P/L", "value": f"${dollar_pnl:,.2f}", "inline": True},
+        {"name": "Days to Expiration", "value": str(days_to_expiration), "inline": True},
+        {"name": "Reason", "value": reason or "Runner position closed based on risk management.", "inline": False},
+    ]
+    embed = _build_embed(
+        "🏃 SWING OPTIONS RUNNER CLOSED",
+        description="Runner position has been closed.",
+        fields=fields,
+        color=COLOR_RED if dollar_pnl < 0 else COLOR_GREEN,
+    )
+    return _send_discord({"embeds": [embed]})
+
+
+def notify_runner_summary(runners: list[dict]) -> bool:
+    lines = []
+    for runner in runners[:5]:
+        lines.append(
+            f"{runner['symbol']} | {runner['contracts_remaining']} contracts | "
+            f"${runner['current_option_price']:.2f} / ${runner['entry_option_price']:.2f} "
+            f"({runner.get('percent_gain_loss', 0):+.1f}%) | stop ${runner['runner_stop_price']:.2f} | "
+            f"target ${runner['runner_target_price']:.2f} | {runner['days_to_expiration']}d"
+        )
+    description = "\n".join(lines) if lines else "No active runners at this time."
+    embed = _build_embed(
+        "🏃 SWING OPTIONS RUNNER SUMMARY",
+        description=description,
+        color=COLOR_BLUE,
+    )
+    return _send_discord({"embeds": [embed]})
+
+
+def notify_daily_summary(summary: str) -> bool:
+    embed = _build_embed("SWING OPTIONS SUMMARY", description=summary, color=COLOR_BLUE)
+    return _send_discord({"embeds": [embed]})

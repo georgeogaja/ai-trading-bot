@@ -15,7 +15,7 @@ import yfinance as yf
 import ta
 from loguru import logger
 from config import ACCOUNT, HARD_RULES, SIGNAL_WEIGHTS
-from database.db import get_active_watchlist, get_mistake_patterns, log_signal
+from db import get_active_watchlist, get_mistake_patterns, log_signal
 
 claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
@@ -324,6 +324,31 @@ def analyze_stock(symbol: str) -> dict:
     high_52wk     = round(float(latest.get('52wk_high', current_price)), 2)
     drawdown_pct  = round(float(latest.get('drawdown_from_high', 0)), 1)
 
+    rsi_momentum = 0.0
+    if len(df) >= 4:
+        prior_rsi = df['RSI'].iloc[-4]
+        if not pd.isna(prior_rsi):
+            rsi_momentum = round(rsi - float(prior_rsi), 2)
+
+    ema_125 = round(float(latest.get('EMA_125', 0)), 2)
+    ema_50 = latest.get('EMA_50', np.nan)
+    ema_72 = latest.get('EMA_72', np.nan)
+    ema_125_val = latest.get('EMA_125', np.nan)
+    trend_aligned = (
+        not pd.isna(ema_50)
+        and not pd.isna(ema_72)
+        and not pd.isna(ema_125_val)
+        and current_price > float(ema_50) > float(ema_72) > float(ema_125_val)
+    )
+
+    stop_loss = option_plan.get('stop_loss_stock_price', current_price)
+    reward_target = max(
+        float(latest.get('resistance_20', current_price * 1.08)),
+        current_price * 1.08,
+    )
+    risk = max(current_price - float(stop_loss), 0.01)
+    risk_reward_ratio = round((reward_target - current_price) / risk, 2) if risk > 0 else 0.0
+
     # Format exactly like George's ThinkorSwim label
     signal_bar = (
         f"BIAS: {bias} | RSI {rsi} | ADX {adx} | "
@@ -339,6 +364,7 @@ def analyze_stock(symbol: str) -> dict:
         "bear_score":       bear,
         "put_score":        put_sc,
         "rsi":              rsi,
+        "rsi_momentum":     rsi_momentum,
         "adx":              adx,
         "bias":             bias,
         "vol_status":       vol_status,
@@ -347,6 +373,9 @@ def analyze_stock(symbol: str) -> dict:
         "falling_wedge":    wedge,
         "ema_50":           round(float(latest.get('EMA_50', 0)), 2),
         "ema_72":           round(float(latest.get('EMA_72', 0)), 2),
+        "ema_125":          ema_125,
+        "trend_aligned":    trend_aligned,
+        "risk_reward_ratio": risk_reward_ratio,
         "drawdown_pct":     drawdown_pct,
         "high_52wk":        high_52wk,
         "signal_bar":       signal_bar,
@@ -472,7 +501,6 @@ Strike: ${technical['suggested_option']['strike']} ({technical['suggested_option
 Expiry: {technical['suggested_option']['expiry']}
 Stop Loss: ${technical['suggested_option']['stop_loss_stock_price']}
 Max Spend: ${technical['suggested_option']['max_to_spend']}
-"""
 
 MACRO CONDITIONS:
 Oil: ${macro.get('oil', 'N/A')}
@@ -533,10 +561,10 @@ RESPOND WITH VALID JSON ONLY:
 # FULL WATCHLIST SCANNER
 # ─────────────────────────────────────────────────────────────
 
-def run_full_scan(macro: dict, account_info: dict) -> list:
+def run_full_scan(macro: dict, account_info: dict) -> dict:
     """
     Scans the full watchlist (core + dynamic).
-    Returns list of actionable A+ signals.
+    Returns actionable A+ signals plus watch-mode candidate symbols.
     """
     from config import CORE_WATCHLIST
 
@@ -548,6 +576,7 @@ def run_full_scan(macro: dict, account_info: dict) -> list:
 
     logger.info(f"📊 Scanning {len(full_watchlist)} stocks...")
     actionable = []
+    watch_candidates = []
 
     for symbol in full_watchlist:
         try:
@@ -584,9 +613,17 @@ def run_full_scan(macro: dict, account_info: dict) -> list:
                         "trade_plan": trade_plan,
                     })
                     logger.info(f"🚨 A+ TRADE SIGNAL: {symbol} | Confidence: {trade_plan.get('confidence')}/10")
+            elif technical.get('signal') == 'LONG' and technical.get('bull_score', 0) >= SIGNAL_WEIGHTS['min_score_long']:
+                watch_candidates.append({
+                    "symbol":    symbol,
+                    "technical": technical,
+                })
 
         except Exception as e:
             logger.error(f"  {symbol}: Scan error — {e}")
 
-    logger.info(f"✅ Scan complete | {len(actionable)} actionable signals")
-    return actionable
+    logger.info(f"✅ Scan complete | {len(actionable)} actionable signals | {len(watch_candidates)} watch candidates")
+    return {
+        "actionable": actionable,
+        "watch_candidates": watch_candidates,
+    }

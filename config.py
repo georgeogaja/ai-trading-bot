@@ -144,6 +144,9 @@ CORE_WATCHLIST = [
     "ONTO", "ENTG",
 ]
 
+# NORMAL MODE: Low resource scan schedule (3 scans per trading day in CT)
+NORMAL_SCAN_TIMES = ["09:45", "12:00", "14:45"]
+
 # ─────────────────────────────────────────────────────────────
 # MACRO SIGNALS (Iran war / oil / rates framework)
 # ─────────────────────────────────────────────────────────────
@@ -179,9 +182,9 @@ MISTAKE_CATEGORIES = [
 # ─────────────────────────────────────────────────────────────
 SCHEDULE = {
     "pre_market_scan":      "08:00",   # Macro briefing
-    "morning_scan":         "10:00",   # Watchlist A+ scan (after first 30 min)
-    "midday_check":         "12:00",   # Position monitor
-    "afternoon_check":      "14:00",   # Position monitor
+    "normal_scan_1":        "09:45",   # Watchlist A+ scan
+    "normal_scan_2":        "12:00",   # Midday watchlist check
+    "normal_scan_3":        "14:45",   # Afternoon watchlist scan
     "close_check":          "15:30",   # Pre-close review
     "after_hours":          "16:30",   # Earnings / news scan
     "insider_scan":         "18:00",   # Form 4 P-type scan

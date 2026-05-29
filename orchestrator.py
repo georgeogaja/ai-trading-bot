@@ -13,7 +13,7 @@ USAGE:
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -33,7 +33,7 @@ logger.add(
 )
 
 # Import all agents
-from database.db import initialize_database
+from db import initialize_database
 from market_intelligence import run_market_intelligence, get_macro_data
 from strategy_engine import run_full_scan, analyze_stock
 from trade_executor import (
@@ -42,9 +42,16 @@ from trade_executor import (
 from learning_engine import (
     generate_weekly_report, get_mistake_patterns, self_adjust_thresholds, load_adjustments
 )
-from config import ACCOUNT, SCHEDULE
+from config import ACCOUNT, NORMAL_SCAN_TIMES, HARD_RULES, SIGNAL_WEIGHTS
 
 CT_TIMEZONE = pytz.timezone("America/Chicago")
+
+WATCH_MODE_STATE = {
+    "active": False,
+    "symbols": [],
+    "expires_at": None,
+    "frequency_minutes": 10,
+}
 
 
 def is_market_open() -> bool:
@@ -65,6 +72,31 @@ def is_past_open_restriction() -> bool:
     now = datetime.now(CT_TIMEZONE)
     no_trade_until = now.replace(hour=10, minute=0, second=0)
     return now >= no_trade_until
+
+
+def activate_watch_mode(symbols: list, duration_minutes: int = 90, frequency_minutes: int = 10):
+    """Activate short-term watch mode for a small set of candidate tickers."""
+    if not symbols:
+        return
+
+    WATCH_MODE_STATE["active"] = True
+    WATCH_MODE_STATE["symbols"] = list(dict.fromkeys(symbols))
+    WATCH_MODE_STATE["expires_at"] = datetime.now(CT_TIMEZONE) + timedelta(minutes=duration_minutes)
+    WATCH_MODE_STATE["frequency_minutes"] = frequency_minutes
+    logger.info(
+        f"👀 Watch Mode activated for {len(WATCH_MODE_STATE['symbols'])} symbols "
+        f"until {WATCH_MODE_STATE['expires_at'].strftime('%H:%M %Z')}"
+    )
+
+
+def deactivate_watch_mode():
+    """Disable watch mode and return to normal scan cadence."""
+    if WATCH_MODE_STATE["active"]:
+        logger.info("✅ Watch Mode expired or deactivated")
+    WATCH_MODE_STATE["active"] = False
+    WATCH_MODE_STATE["symbols"] = []
+    WATCH_MODE_STATE["expires_at"] = None
+    WATCH_MODE_STATE["frequency_minutes"] = 10
 
 
 # ─────────────────────────────────────────────────────────────
@@ -98,13 +130,13 @@ def task_pre_market_macro():
 
 
 def task_morning_scan():
-    """10:00 AM CT — Full watchlist A+ scan and trade placement."""
+    """Normal watchlist scan — 3x daily low-resource A+ signal checks."""
     logger.info("=" * 60)
-    logger.info("🔍 MORNING SCAN: Full Watchlist A+ Signal Scan")
+    logger.info("🔍 NORMAL SCAN: Watchlist A+ Signal Scan")
     logger.info("=" * 60)
 
     if not is_market_open():
-        logger.info("Market closed — skipping morning scan")
+        logger.info("Market closed — skipping scan")
         return
 
     if not is_past_open_restriction():
@@ -136,13 +168,22 @@ def task_morning_scan():
         print(f"\n{'='*60}")
         print("SCANNING ALL WATCHLIST STOCKS:")
         print(f"{'='*60}")
-        signals = run_full_scan(macro, account)
+        scan_result = run_full_scan(macro, account)
+        signals = scan_result.get("actionable", [])
+        watch_candidates = scan_result.get("watch_candidates", [])
+
+        if watch_candidates:
+            activate_watch_mode(
+                [candidate['symbol'] for candidate in watch_candidates],
+                duration_minutes=90,
+                frequency_minutes=10,
+            )
 
         if not signals:
             logger.info("💤 No A+ setups found today — patience is the strategy")
             return
 
-        # Execute trades for A+ signals with confidence >= 7
+        # Execute trades for A+ signals with confidence >= 8
         logger.info(f"\n🚨 Found {len(signals)} A+ signals — evaluating for execution")
 
         for signal in signals:
@@ -153,15 +194,14 @@ def task_morning_scan():
             print(f"\n{'─'*40}")
             print(f"🎯 SIGNAL: {symbol}")
             print(f"   Confidence:  {confidence}/10")
-            print(f"   Strike:      ${trade_plan.get('trade_plan', {}).get('strike', 'N/A')}")
-            print(f"   Expiry:      {trade_plan.get('trade_plan', {}).get('expiry', 'N/A')}")
-            print(f"   Stop:        ${trade_plan.get('trade_plan', {}).get('stop_loss_stock_price', 'N/A')}")
-            print(f"   Thesis:      {trade_plan.get('trade_plan', {}).get('thesis', 'N/A')[:100]}")
+            print(f"   Strike:      ${trade_plan.get('strike', 'N/A')}")
+            print(f"   Expiry:      {trade_plan.get('expiry', 'N/A')}")
+            print(f"   Stop:        ${trade_plan.get('stop_loss_stock_price', 'N/A')}")
+            print(f"   Thesis:      {trade_plan.get('thesis', 'N/A')[:100]}")
 
             # Only auto-execute with confidence >= 8
             if confidence >= 8:
-                actual_plan = trade_plan.get('trade_plan', {})
-                result = place_options_trade(symbol, actual_plan, account)
+                result = place_options_trade(symbol, trade_plan, account)
 
                 if result.get('success'):
                     logger.info(f"✅ TRADE PLACED: {symbol} | Order: {result.get('order_id')}")
@@ -176,7 +216,7 @@ def task_morning_scan():
 
 
 def task_position_monitor():
-    """Every 30 minutes — Check stops and targets."""
+    """Every 15 minutes during market hours — monitor open trades and risk."""
     if not is_market_open():
         return
 
@@ -185,6 +225,37 @@ def task_position_monitor():
         monitor_open_positions()
     except Exception as e:
         logger.error(f"Position monitor error: {e}")
+
+
+def task_watch_mode_monitor():
+    """Every 10 minutes while watch mode is active — monitor candidate symbols."""
+    if not WATCH_MODE_STATE["active"]:
+        return
+
+    now = datetime.now(CT_TIMEZONE)
+    if WATCH_MODE_STATE["expires_at"] and now >= WATCH_MODE_STATE["expires_at"]:
+        deactivate_watch_mode()
+        return
+
+    logger.info(f"👀 Watch Mode monitor checking {len(WATCH_MODE_STATE['symbols'])} symbols")
+    updated_symbols = []
+
+    for symbol in WATCH_MODE_STATE["symbols"]:
+        try:
+            technical = analyze_stock(symbol)
+            if technical.get('signal') in ('LONG', 'A+ LONG') and technical.get('bull_score', 0) >= SIGNAL_WEIGHTS['min_score_long']:
+                updated_symbols.append(symbol)
+            else:
+                logger.info(f"🛑 Watch candidate invalidated: {symbol} | Signal: {technical.get('signal')}")
+        except Exception as e:
+            logger.warning(f"Watch monitor failed for {symbol}: {e}")
+
+    if not updated_symbols:
+        deactivate_watch_mode()
+        return
+
+    WATCH_MODE_STATE["symbols"] = updated_symbols
+    logger.info(f"✅ Watch Mode continues for {len(updated_symbols)} symbols")
 
 
 def task_after_hours():
@@ -256,8 +327,9 @@ def main():
         logger.info("Running single scan...")
         macro   = get_macro_data()
         account = get_account_status()
-        signals = run_full_scan(macro, account)
-        logger.info(f"Scan complete: {len(signals)} signals found")
+        scan_result = run_full_scan(macro, account)
+        signals = scan_result.get("actionable", [])
+        logger.info(f"Scan complete: {len(signals)} actionable signals found")
         return
 
     if "--report" in sys.argv:
@@ -281,16 +353,18 @@ def main():
         name="Pre-Market Macro + Intelligence",
     )
 
-    scheduler.add_job(
-        task_morning_scan,
-        CronTrigger(day_of_week="mon-fri", hour=10, minute=0, timezone=CT_TIMEZONE),
-        id="morning_scan",
-        name="Morning A+ Watchlist Scan",
-    )
+    for scan_time in NORMAL_SCAN_TIMES:
+        hour, minute = scan_time.split(":")
+        scheduler.add_job(
+            task_morning_scan,
+            CronTrigger(day_of_week="mon-fri", hour=int(hour), minute=int(minute), timezone=CT_TIMEZONE),
+            id=f"normal_scan_{hour}_{minute}",
+            name=f"Normal Watchlist Scan {scan_time}",
+        )
 
-    # Position monitor — every 30 minutes during market hours
+    # Position monitor — every 15 minutes while there are open trades
     for hour in range(10, 16):
-        for minute in [0, 30]:
+        for minute in [0, 15, 30, 45]:
             scheduler.add_job(
                 task_position_monitor,
                 CronTrigger(
@@ -301,6 +375,13 @@ def main():
                 id=f"monitor_{hour}_{minute}",
                 name=f"Position Monitor {hour}:{minute:02d}",
             )
+
+    scheduler.add_job(
+        task_watch_mode_monitor,
+        CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/10", timezone=CT_TIMEZONE),
+        id="watch_mode_monitor",
+        name="Watch Mode Monitor",
+    )
 
     scheduler.add_job(
         task_after_hours,
