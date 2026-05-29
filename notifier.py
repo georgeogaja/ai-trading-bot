@@ -2,11 +2,16 @@
 
 Uses Discord embeds for clean, professional swing options alerts.
 """
+from dotenv import load_dotenv
+from pathlib import Path
 import os
 from datetime import datetime, timezone
 
 import requests
 from loguru import logger
+
+env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
@@ -20,18 +25,34 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _clean_string(value) -> str:
+    if value is None:
+        return "N/A"
+    cleaned = str(value).strip()
+    return cleaned if cleaned else "N/A"
+
+
+def _sanitize_fields(fields: list[dict]) -> list[dict]:
+    sanitized = []
+    for field in fields or []:
+        name = _clean_string(field.get("name"))
+        value = _clean_string(field.get("value"))
+        inline = bool(field.get("inline", False))
+        sanitized.append({"name": name, "value": value, "inline": inline})
+    return sanitized
+
+
 def _build_embed(title: str, description: str = None, fields: list[dict] = None, color: int = COLOR_BLUE) -> dict:
     embed = {
-        "title": title,
-        "type": "rich",
+        "title": _clean_string(title),
         "color": color,
-        "timestamp": _utc_timestamp(),
         "footer": {"text": "Paper trading only"},
     }
-    if description:
-        embed["description"] = description
-    if fields:
-        embed["fields"] = fields
+    if description is not None:
+        embed["description"] = _clean_string(description)
+    sanitized_fields = _sanitize_fields(fields)
+    if sanitized_fields:
+        embed["fields"] = sanitized_fields
     return embed
 
 
@@ -45,14 +66,18 @@ def _send_discord(payload: dict) -> bool:
         response.raise_for_status()
         logger.info("Discord notification sent")
         return True
-    except Exception as exc:
-        logger.warning(f"Discord webhook failed: {exc}")
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else "unknown"
+        response_text = exc.response.text if exc.response is not None else "No response body"
+        logger.warning(f"Discord webhook HTTP error: {status_code} - {response_text}")
+        return False
+    except Exception:
+        logger.warning("Discord webhook failed due to network or configuration issue")
         return False
 
 
 def send_discord_message(message: str) -> bool:
-    embed = _build_embed("Swing Options Bot Notification", description=message, color=COLOR_GREY)
-    return _send_discord({"embeds": [embed]})
+    return _send_discord({"content": _clean_string(message)})
 
 
 def notify_watch_mode(
