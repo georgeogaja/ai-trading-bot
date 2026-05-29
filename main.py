@@ -28,6 +28,7 @@ except Exception:
 from alpaca_broker import is_kill_switch_engaged
 from config import ACCOUNT, CORE_WATCHLIST, NORMAL_SCAN_TIMES
 from db import initialize_database
+from log_setup import configure_logging
 from market_intelligence import get_macro_data
 from notifier import notify_daily_summary
 from strategy_engine import run_full_scan
@@ -61,6 +62,12 @@ def validate_environment() -> None:
             "ERROR: ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env."
         )
 
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise SystemExit(
+            "ERROR: ANTHROPIC_API_KEY not set — Claude trade decisions will not function. "
+            "Add ANTHROPIC_API_KEY to your .env file."
+        )
+
     if not ACCOUNT.get("paper_trading", True):
         raise SystemExit(
             "ERROR: config.ACCOUNT.paper_trading must remain True for safe paper trading."
@@ -71,8 +78,17 @@ def validate_environment() -> None:
             f"ERROR: Kill switch engaged before startup: {is_kill_switch_engaged()[1]}"
         )
 
-    logger.info("✅ Environment validated for Alpaca paper trading")
-    logger.info(f"✅ Loaded watchlist from config: {len(CORE_WATCHLIST)} symbols")
+    discord_url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+    if not discord_url:
+        logger.warning(
+            "DISCORD_WEBHOOK_URL not set — trade events will be logged only, no Discord alerts."
+        )
+
+    logger.info("Environment validated for Alpaca paper trading")
+    logger.info(f"Watchlist loaded: {len(CORE_WATCHLIST)} symbols")
+    logger.info(
+        f"Min confidence to execute: {ACCOUNT.get('min_confidence_to_execute', 8)}/10"
+    )
 
 
 def print_account_summary(account: dict) -> None:
@@ -224,8 +240,7 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    logger.remove()
-    logger.add(sys.stdout, level="INFO", format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
+    configure_logging("main")
 
     dry_run_env = os.getenv("DRY_RUN", "true").strip().lower() == "true"
     dry_run = not args.execute and dry_run_env

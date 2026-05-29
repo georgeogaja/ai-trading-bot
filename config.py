@@ -12,14 +12,15 @@ load_dotenv()
 # ACCOUNT CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 ACCOUNT = {
-    "total_capital":        10_000,    # Total account size
-    "max_per_trade_pct":    0.20,      # Max 20% per trade = $2,000 max
-    "max_open_positions":   5,         # Never more than 5 concurrent positions
-    "reserve_cash_pct":     0.30,      # Always keep 30% cash reserve = $3,000
-    "paper_trading":        True,      # ALWAYS start in paper mode
-    "kill_switch_enabled":  True,      # Enable daily loss and trade count protection
-    "max_daily_loss_usd":   500,       # Stop new trades after this much realized loss in a day
-    "max_trades_per_day":   5,         # Stop new trades after this many fills in a day
+    "total_capital":              10_000,    # Total account size
+    "max_per_trade_pct":          0.20,      # Max 20% per trade = $2,000 max
+    "max_open_positions":         5,         # Never more than 5 concurrent positions
+    "reserve_cash_pct":           0.30,      # Always keep 30% cash reserve = $3,000
+    "paper_trading":              True,      # ALWAYS start in paper mode
+    "kill_switch_enabled":        True,      # Enable daily loss and trade count protection
+    "max_daily_loss_usd":         500,       # Stop new trades after this much realized loss in a day
+    "max_trades_per_day":         5,         # Stop new trades after this many fills in a day
+    "min_confidence_to_execute":  8,         # Minimum Claude confidence score (1-10) before placing a trade
 }
 
 # Override PAPER_TRADING from .env when explicitly set
@@ -190,4 +191,17 @@ SCHEDULE = {
     "insider_scan":         "18:00",   # Form 4 P-type scan
     "weekly_report":        "SAT 09:00",  # Saturday morning report
     "watchlist_rebuild":    "SUN 20:00",  # Sunday night watchlist update
+}
+
+CT_TIMEZONE = "America/Chicago"   # All cron schedules use this timezone
+
+# ─────────────────────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────────────────────
+LOGGING = {
+    "log_dir":      "logs",
+    "log_level":    "INFO",
+    "rotation":     "1 day",
+    "retention":    "30 days",
+    "format":       "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
 }
