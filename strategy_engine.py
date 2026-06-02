@@ -622,6 +622,12 @@ def run_full_scan(macro: dict, account_info: dict) -> dict:
 
                 if trade_plan.get('decision') == 'TRADE':
                     trade_plan = merge_trade_plan_with_suggestion(trade_plan, technical.get('suggested_option', {}))
+                    # Carry volume and risk/reward through to the executor so the
+                    # volume-tier sizing and R/R gates can evaluate this setup.
+                    for _dst in (trade_plan, trade_plan.get('trade_plan', {})):
+                        if isinstance(_dst, dict):
+                            _dst['vol_ratio'] = technical.get('vol_ratio', 1.0)
+                            _dst['risk_reward_ratio'] = technical.get('risk_reward_ratio', 0.0)
                     actionable.append({
                         "symbol":     symbol,
                         "technical":  technical,

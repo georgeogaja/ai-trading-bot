@@ -7,7 +7,7 @@ Handles options order placement, position sizing, stop loss, profit targets, and
 import yfinance as yf
 from datetime import datetime
 from loguru import logger
-from config import ACCOUNT, HARD_RULES
+from config import ACCOUNT, HARD_RULES, POSITION_SIZING, RISK_REWARD
 from db import (
     log_trade_entry,
     update_trade_exit,
@@ -43,6 +43,46 @@ def get_account_status() -> dict:
     return broker_get_account_status()
 
 
+def resolve_trade_plan(trade_plan: dict) -> dict:
+    """
+    Normalize a trade plan into a single flat dict.
+
+    The scanner hands us the full Claude decision, which nests the option
+    details under a "trade_plan" key. Surface those nested fields to the top
+    level (nested values win) so downstream sizing/validation can read them
+    consistently regardless of which shape it was given.
+    """
+    if not isinstance(trade_plan, dict):
+        return {}
+    resolved = dict(trade_plan)
+    nested = trade_plan.get("trade_plan")
+    if isinstance(nested, dict):
+        for key, value in nested.items():
+            resolved[key] = value
+    return resolved
+
+
+def determine_volume_size_tier(vol_ratio: float) -> dict:
+    """
+    Map a volume ratio (current volume vs 50-day average) to a sizing tier.
+
+    Returns a dict with:
+      action          — "TRADE" or "WATCH"
+      size_multiplier — fraction of the normal dollar allocation to risk
+      tier            — human-readable tier label
+    """
+    vol_ratio = float(vol_ratio or 0)
+    if vol_ratio >= POSITION_SIZING["volume_normal_min"]:
+        return {"action": "TRADE", "size_multiplier": 1.0, "tier": "NORMAL"}
+    if vol_ratio >= POSITION_SIZING["volume_reduced_min"]:
+        return {
+            "action": "TRADE",
+            "size_multiplier": POSITION_SIZING["reduced_size_multiplier"],
+            "tier": "REDUCED",
+        }
+    return {"action": "WATCH", "size_multiplier": 0.0, "tier": "WATCH_ONLY"}
+
+
 def validate_trade(symbol: str, trade_plan: dict, account: dict) -> tuple:
     """
     Validate a trade against George's hard rules and account constraints.
@@ -51,20 +91,47 @@ def validate_trade(symbol: str, trade_plan: dict, account: dict) -> tuple:
     if not trade_plan:
         return False, "Trade plan missing"
 
+    plan = resolve_trade_plan(trade_plan)
+
     if is_kill_switch_engaged()[0]:
         return False, "Kill switch engaged — no new trades allowed today"
 
     cash = account.get("cash", 0)
     buying_power = account.get("buying_power", 0)
     open_pos = account.get("open_positions", 0)
-    max_spend = float(trade_plan.get("max_to_spend", 0) or 0)
-    strike_pct = float(trade_plan.get("strike_pct_otm", 0) or 0)
+    max_spend = float(plan.get("max_to_spend", 0) or 0)
+    strike_pct = float(plan.get("strike_pct_otm", 0) or 0)
+    vol_ratio = float(plan.get("vol_ratio", 0) or 0)
+    risk_reward = float(plan.get("risk_reward_ratio", 0) or 0)
+
+    # Volume gate — below the reduced-size floor we never trade (watch only).
+    if vol_ratio < POSITION_SIZING["volume_reduced_min"]:
+        return False, (
+            f"Volume too low: {vol_ratio:.2f}x below "
+            f"{POSITION_SIZING['volume_reduced_min']:.2f}x — watch only"
+        )
+
+    # Risk/reward gates — absolute floor first, then the standard minimum.
+    if risk_reward < RISK_REWARD["hard_floor"]:
+        return False, (
+            f"Risk/reward {risk_reward:.2f} below absolute floor "
+            f"{RISK_REWARD['hard_floor']:.2f} — never trade"
+        )
+    if risk_reward < RISK_REWARD["min_to_execute"]:
+        return False, (
+            f"Risk/reward {risk_reward:.2f} below minimum "
+            f"{RISK_REWARD['min_to_execute']:.2f}"
+        )
 
     if max_spend <= 0:
         return False, "Trade size estimate missing"
 
-    if max_spend > ACCOUNT["total_capital"] * ACCOUNT["max_per_trade_pct"]:
-        return False, f"Position too large: ${max_spend:.2f} exceeds 20% limit"
+    max_per_trade = ACCOUNT["total_capital"] * ACCOUNT["max_per_trade_pct"]
+    if max_spend > max_per_trade:
+        return False, (
+            f"Position too large: ${max_spend:.2f} exceeds "
+            f"{ACCOUNT['max_per_trade_pct'] * 100:.0f}% limit (${max_per_trade:.2f})"
+        )
 
     reserve = ACCOUNT["total_capital"] * ACCOUNT["reserve_cash_pct"]
     if cash - max_spend < reserve:
@@ -79,10 +146,10 @@ def validate_trade(symbol: str, trade_plan: dict, account: dict) -> tuple:
     if strike_pct > HARD_RULES["max_otm_pct"] * 100:
         return False, f"Strike too far OTM: {strike_pct:.1f}% exceeds 15% limit"
 
-    if not trade_plan.get("stop_loss_stock_price"):
+    if not plan.get("stop_loss_stock_price"):
         return False, "No stop loss defined — trade rejected"
 
-    if int(trade_plan.get("contracts", 1)) > HARD_RULES["max_contracts"]:
+    if int(plan.get("contracts", 1)) > HARD_RULES["max_contracts"]:
         return False, "Max 1 contract per trade"
 
     return True, "All checks passed"
@@ -153,23 +220,53 @@ def get_adaptive_active_interval() -> int:
 
 def place_options_trade(symbol: str, trade_plan: dict, account: dict) -> dict:
     """Validate and place an options trade in Alpaca paper trading."""
-    is_valid, reason = validate_trade(symbol, trade_plan, account)
+    plan = resolve_trade_plan(trade_plan)
+
+    # Volume-based position sizing. Below the reduced floor is watch-only and
+    # never reaches order placement; the reduced tier halves the dollar risk
+    # allocation (contracts stay at 1 per George's hard rule).
+    vol_ratio = float(plan.get("vol_ratio", 0) or 0)
+    size_tier = determine_volume_size_tier(vol_ratio)
+    if size_tier["action"] == "WATCH":
+        reason = (
+            f"Volume {vol_ratio:.2f}x below "
+            f"{POSITION_SIZING['volume_reduced_min']:.2f}x — watch only, no trade"
+        )
+        logger.info(f"Watch only: {symbol} | {reason}")
+        notify_risk_blocked(
+            symbol,
+            plan.get("option_type", "Unknown"),
+            reason,
+            "Volume below tradeable threshold",
+            "Monitor for a volume expansion before considering an entry.",
+        )
+        return {"success": False, "reason": reason}
+
+    if size_tier["size_multiplier"] != 1.0:
+        base_spend = float(plan.get("max_to_spend", 0) or 0)
+        plan["max_to_spend"] = round(base_spend * size_tier["size_multiplier"], 2)
+        logger.info(
+            f"Reduced sizing: {symbol} | vol {vol_ratio:.2f}x | "
+            f"max_to_spend ${base_spend:.2f} → ${plan['max_to_spend']:.2f}"
+        )
+
+    is_valid, reason = validate_trade(symbol, plan, account)
     if not is_valid:
         logger.warning(f"Trade rejected: {symbol} | {reason}")
         notify_risk_blocked(
             symbol,
-            trade_plan.get("option_type", "Unknown"),
+            plan.get("option_type", "Unknown"),
             reason,
             "Risk or sizing rule blocked this setup",
             "Reduce position size or improve setup quality before retrying.",
         )
         return {"success": False, "reason": reason}
 
-    option_type = trade_plan.get("option_type", "CALL")
-    strike = float(trade_plan.get("strike", 0) or 0)
-    expiry = trade_plan.get("expiry", "")
-    price_low = float(trade_plan.get("estimated_option_price_low", 0) or 0)
-    price_high = float(trade_plan.get("estimated_option_price_high", 0) or 0)
+    option_type = plan.get("option_type", "CALL")
+    strike = float(plan.get("strike", 0) or 0)
+    expiry = plan.get("expiry", "")
+    price_low = float(plan.get("estimated_option_price_low", 0) or 0)
+    price_high = float(plan.get("estimated_option_price_high", 0) or 0)
     limit_price = round((price_low + price_high) / 2, 2)
 
     contract_symbol = find_option_contract_symbol(symbol, strike, expiry, option_type)
@@ -191,11 +288,11 @@ def place_options_trade(symbol: str, trade_plan: dict, account: dict) -> dict:
         "expiry": expiry,
         "contracts": 1,
         "entry_option_price": limit_price,
-        "stop_loss_level": trade_plan.get("stop_loss_stock_price"),
-        "target_1": trade_plan.get("target_1_option_price"),
-        "target_2": trade_plan.get("target_2_option_price"),
-        "catalyst": trade_plan.get("catalyst"),
-        "thesis": trade_plan.get("thesis"),
+        "stop_loss_level": plan.get("stop_loss_stock_price"),
+        "target_1": plan.get("target_1_option_price"),
+        "target_2": plan.get("target_2_option_price"),
+        "catalyst": plan.get("catalyst"),
+        "thesis": plan.get("thesis"),
         "alpaca_order_id": str(order_result.get("order_id")),
     })
 
@@ -205,13 +302,13 @@ def place_options_trade(symbol: str, trade_plan: dict, account: dict) -> dict:
         strike=strike,
         expiry=expiry,
         entry_premium=limit_price,
-        stop_loss_premium=float(trade_plan.get("stop_loss_option_price", 0) or 0),
-        profit_target_premium=float(trade_plan.get("target_1_option_price", 0) or 0),
-        max_risk=float(trade_plan.get("max_to_spend", 0) or 0),
-        position_size=f"{int(trade_plan.get('contracts', 1))} contract(s)",
+        stop_loss_premium=float(plan.get("stop_loss_option_price", 0) or 0),
+        profit_target_premium=float(plan.get("target_1_option_price", 0) or 0),
+        max_risk=float(plan.get("max_to_spend", 0) or 0),
+        position_size=f"{int(plan.get('contracts', 1))} contract(s) ({size_tier['tier']} size, vol {vol_ratio:.2f}x)",
         expected_hold=f"Until expiration or invalidation, typically a multi-week swing",
-        reason=trade_plan.get("thesis", "Confirmed swing options setup."),
-        exit_plan=trade_plan.get("exit_plan", "Exit at target or on invalidation."),
+        reason=plan.get("thesis", "Confirmed swing options setup."),
+        exit_plan=plan.get("exit_plan", "Exit at target or on invalidation."),
     )
 
     # Transition to ACTIVE monitoring for this symbol

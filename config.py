@@ -13,18 +13,37 @@ load_dotenv()
 # ─────────────────────────────────────────────────────────────
 ACCOUNT = {
     "total_capital":              10_000,    # Total account size
-    "max_per_trade_pct":          0.20,      # Max 20% per trade = $2,000 max
+    "max_per_trade_pct":          0.05,      # Max 5% per trade = $500 max (tightened risk control)
     "max_open_positions":         5,         # Never more than 5 concurrent positions
     "reserve_cash_pct":           0.30,      # Always keep 30% cash reserve = $3,000
     "paper_trading":              True,      # ALWAYS start in paper mode
     "kill_switch_enabled":        True,      # Enable daily loss and trade count protection
     "max_daily_loss_usd":         500,       # Stop new trades after this much realized loss in a day
     "max_trades_per_day":         5,         # Stop new trades after this many fills in a day
-    "min_confidence_to_execute":  8,         # Minimum Claude confidence score (1-10) before placing a trade
+    "min_confidence_to_execute":  7,         # Minimum Claude confidence score (1-10) before placing a trade
 }
 
 # Override PAPER_TRADING from .env when explicitly set
 ACCOUNT["paper_trading"] = os.getenv("PAPER_TRADING", str(ACCOUNT["paper_trading"]).lower()).lower() == "true"
+
+# ─────────────────────────────────────────────────────────────
+# VOLUME-BASED POSITION SIZING
+# Volume ratio = current volume / 50-day average volume
+# ─────────────────────────────────────────────────────────────
+POSITION_SIZING = {
+    "volume_normal_min":        1.20,   # vol_ratio >= 1.20 → full (normal) position size
+    "volume_reduced_min":       0.70,   # vol_ratio 0.70–1.19 → reduced size (see multiplier)
+    "reduced_size_multiplier":  0.50,   # Reduced tier risks 50% of normal dollar allocation
+    # vol_ratio < 0.70 → WATCH ONLY (no trade placed)
+}
+
+# ─────────────────────────────────────────────────────────────
+# RISK / REWARD GATES
+# ─────────────────────────────────────────────────────────────
+RISK_REWARD = {
+    "min_to_execute":   1.80,   # Standard minimum risk/reward required to place a new trade
+    "hard_floor":       1.50,   # Absolute floor — never trade below this under any condition
+}
 
 # ─────────────────────────────────────────────────────────────
 # GEORGE'S HARD RULES (NEVER VIOLATE — SYSTEM WILL REJECT)
