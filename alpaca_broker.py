@@ -11,8 +11,11 @@ from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOptionContractsRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, ContractType
+from alpaca.data.historical.option import OptionHistoricalDataClient
+from alpaca.data.requests import OptionSnapshotRequest
 from db import get_today_trade_count, get_today_realized_pnl
 from config import ACCOUNT
+from option_liquidity import liquidity_score
 
 load_dotenv()
 
@@ -148,6 +151,116 @@ def find_option_contract_symbol(symbol: str, strike: float, expiry: str, option_
         return best.symbol
     except Exception as e:
         logger.error(f"Option contract lookup failed: {e}")
+        return None
+
+
+_option_data_client = None
+
+
+def get_option_data_client() -> OptionHistoricalDataClient:
+    """Lazily create a single options market-data client."""
+    global _option_data_client
+    if _option_data_client is None:
+        if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+            raise RuntimeError("Missing ALPACA_API_KEY or ALPACA_SECRET_KEY in .env")
+        _option_data_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    return _option_data_client
+
+
+def get_option_snapshots(contract_symbols: list[str]) -> dict:
+    """Fetch live liquidity quotes for one or more option contracts.
+
+    Returns {contract_symbol: {bid, ask, bid_size, ask_size, volume,
+    open_interest}}. Fields are None when the feed omits them (open interest is
+    not exposed by the Alpaca snapshot model). Returns {} on any error — the
+    caller decides how to treat missing data via OPTIONS_LIQUIDITY policy.
+    """
+    if not contract_symbols:
+        return {}
+    try:
+        client = get_option_data_client()
+        request = OptionSnapshotRequest(symbol_or_symbols=contract_symbols)
+        snapshots = client.get_option_snapshot(request)
+        items = snapshots.items() if hasattr(snapshots, "items") else []
+        out = {}
+        for sym, snap in items:
+            quote = getattr(snap, "latest_quote", None)
+            daily = getattr(snap, "daily_bar", None)
+            out[sym] = {
+                "bid": float(quote.bid_price) if quote and quote.bid_price is not None else None,
+                "ask": float(quote.ask_price) if quote and quote.ask_price is not None else None,
+                "bid_size": float(quote.bid_size) if quote and quote.bid_size is not None else None,
+                "ask_size": float(quote.ask_size) if quote and quote.ask_size is not None else None,
+                "volume": float(daily.volume) if daily and daily.volume is not None else None,
+                "open_interest": None,  # not provided by the snapshot model
+            }
+        return out
+    except Exception as e:
+        logger.warning(f"Option snapshot fetch failed: {e}")
+        return {}
+
+
+def find_best_option_contract(symbol: str, strike: float, expiry: str, option_type: str) -> dict:
+    """Select the most liquid near-the-money contract for the trade plan.
+
+    Fetches the candidate contracts (same strike/expiry window as
+    find_option_contract_symbol), pulls their liquidity snapshots, and ranks
+    them by liquidity_score (tight spread + OI + volume + strike proximity).
+    Returns {symbol, strike, expiry, liquidity} for the best candidate, or None
+    if no contract is found.
+
+    If snapshot data is unavailable for all candidates, falls back to the
+    closest-strike contract with an empty liquidity dict so the executor's
+    liquidity gate can apply the configured fail-open/closed policy.
+    """
+    try:
+        expiry_date = datetime.strptime(expiry, "%Y-%m-%d")
+        contract_type = ContractType.CALL if option_type == "CALL" else ContractType.PUT
+        request = GetOptionContractsRequest(
+            underlying_symbol=symbol,
+            expiration_date_gte=(expiry_date - timedelta(days=7)).strftime("%Y-%m-%d"),
+            expiration_date_lte=(expiry_date + timedelta(days=7)).strftime("%Y-%m-%d"),
+            strike_price_gte=str(strike * 0.95),
+            strike_price_lte=str(strike * 1.05),
+            type=contract_type,
+            limit=10,
+        )
+        client = get_alpaca_client()
+        contracts = client.get_option_contracts(request)
+        contract_list = getattr(contracts, "option_contracts", []) or []
+        if not contract_list:
+            logger.warning(f"No option contracts found for {symbol} {strike} {expiry} {option_type}")
+            return None
+
+        symbols = [c.symbol for c in contract_list]
+        snapshots = get_option_snapshots(symbols)
+
+        # Rank by liquidity (preference). Contracts that fail the liquidity gate
+        # score -inf, so a tradeable contract is always chosen when one exists.
+        def _score(contract) -> float:
+            quote = snapshots.get(contract.symbol, {})
+            return liquidity_score(quote, float(contract.strike_price), strike)
+
+        best = max(contract_list, key=_score)
+        best_quote = snapshots.get(best.symbol, {})
+
+        # If nothing scored (no usable snapshots at all), fall back to closest strike.
+        if not snapshots:
+            best = min(contract_list, key=lambda c: abs(float(c.strike_price) - strike))
+            best_quote = {}
+
+        logger.info(
+            f"Selected option contract {best.symbol} | Strike {best.strike_price} | "
+            f"Expiry {best.expiration_date}"
+        )
+        return {
+            "symbol": best.symbol,
+            "strike": float(best.strike_price),
+            "expiry": str(best.expiration_date),
+            "liquidity": best_quote,
+        }
+    except Exception as e:
+        logger.error(f"Best option contract lookup failed: {e}")
         return None
 
 

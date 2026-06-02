@@ -7,7 +7,7 @@ Handles options order placement, position sizing, stop loss, profit targets, and
 import yfinance as yf
 from datetime import datetime
 from loguru import logger
-from config import ACCOUNT, HARD_RULES, POSITION_SIZING, RISK_REWARD
+from config import ACCOUNT, HARD_RULES, OPTIONS_LIQUIDITY, POSITION_SIZING, RISK_REWARD
 from db import (
     log_trade_entry,
     update_trade_exit,
@@ -21,14 +21,17 @@ from alpaca_broker import (
     get_account_status as broker_get_account_status,
     get_positions as broker_get_positions,
     find_option_contract_symbol,
+    find_best_option_contract,
     place_option_order,
     close_alpaca_position,
     is_kill_switch_engaged,
 )
+from option_liquidity import evaluate_liquidity, describe
 from notifier import (
     notify_trade_entered,
     notify_trade_exited,
     notify_risk_blocked,
+    notify_liquidity_blocked,
     notify_runner_created,
     notify_runner_stop_moved,
     notify_runner_target_hit,
@@ -269,9 +272,43 @@ def place_options_trade(symbol: str, trade_plan: dict, account: dict) -> dict:
     price_high = float(plan.get("estimated_option_price_high", 0) or 0)
     limit_price = round((price_low + price_high) / 2, 2)
 
-    contract_symbol = find_option_contract_symbol(symbol, strike, expiry, option_type)
-    if not contract_symbol:
+    # Select the most liquid near-the-money contract among the candidates.
+    contract = find_best_option_contract(symbol, strike, expiry, option_type)
+    if not contract:
         return {"success": False, "reason": "Unable to locate option contract"}
+    contract_symbol = contract["symbol"]
+    liquidity = contract.get("liquidity", {})
+
+    # ── Options liquidity gate (Phase 3D) ─────────────────────
+    # Final pre-execution check: reject illiquid / untradeable contracts. When
+    # the snapshot feed returns nothing, honour the fail-open/closed policy.
+    verdict = evaluate_liquidity(liquidity)
+    details_txt = describe(verdict["details"])
+    no_data = not any(v is not None for v in (liquidity or {}).values())
+
+    if no_data and not OPTIONS_LIQUIDITY.get("fail_open_on_error", False):
+        reason = "option rejected: liquidity data unavailable"
+        logger.warning(f"{reason} | {symbol} {contract_symbol}")
+        notify_liquidity_blocked(symbol, option_type, contract_symbol, reason, details_txt)
+        return {"success": False, "reason": reason}
+
+    if not no_data and not verdict["approved"]:
+        logger.warning(
+            f"{verdict['reason']} | {symbol} {contract_symbol} | {details_txt}"
+        )
+        notify_liquidity_blocked(
+            symbol, option_type, contract_symbol, verdict["reason"], details_txt
+        )
+        return {"success": False, "reason": verdict["reason"]}
+
+    logger.info(f"option approved: liquidity OK | {symbol} {contract_symbol} | {details_txt}")
+
+    # Use the live mid as the limit price when the plan carries no estimate, so
+    # the order is actually marketable; otherwise keep the planned price.
+    mid = verdict["details"].get("mid")
+    if limit_price <= 0 and mid:
+        limit_price = round(float(mid), 2)
+        logger.info(f"Limit price set from live mid for {contract_symbol}: ${limit_price}")
 
     order_result = place_option_order(contract_symbol, 1, limit_price)
     if not order_result.get("success"):
@@ -351,7 +388,17 @@ def monitor_open_positions():
         option_symbol = trade.get('option_symbol')
         current_option_price = option_prices.get(option_symbol, trade.get('entry_option_price', 0))
 
-        if stop and current_stock <= stop:
+        # Direction-aware stop. A CALL's stop is a stock price BELOW entry
+        # (trigger when price falls to it); a PUT's stop is a stock price ABOVE
+        # entry (trigger when price rises to it). Using the wrong comparison
+        # would stop every PUT out immediately, so branch on the trade type.
+        trade_type = str(trade.get('trade_type') or 'CALL').upper()
+        if trade_type == 'PUT':
+            stop_hit = bool(stop) and current_stock >= stop
+        else:
+            stop_hit = bool(stop) and current_stock <= stop
+
+        if stop_hit:
             logger.warning(f"🚨 STOP LOSS: {symbol} @ ${current_stock:.2f} | stop ${stop:.2f}")
             exit_pnl = 0.0
             if trade.get('entry_option_price') is not None:

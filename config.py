@@ -46,6 +46,22 @@ RISK_REWARD = {
 }
 
 # ─────────────────────────────────────────────────────────────
+# PUT / BEARISH SETUP SUPPORT (Phase 3B)
+# Controls when the bot is allowed to take the SHORT side via PUTs.
+# All existing CALL/LONG logic and safety controls are unaffected.
+# ─────────────────────────────────────────────────────────────
+PUT_SUPPORT = {
+    "enabled":                      True,  # Master switch for bearish/PUT setups
+    "min_put_score":                8,     # bear_score required for an A+ SHORT (mirrors min_score_aplus)
+    "require_bear_bias":            True,  # Stock structural BIAS must be BEAR (price < EMA50 < EMA72 < EMA125)
+    "require_downside_momentum":    True,  # -DI must exceed +DI (momentum confirms downside)
+    # In a BULLISH market regime, only allow a PUT when the stock is clearly weak
+    # RELATIVE to the market: its trailing 21-day return must lag SPY by at least
+    # this many percentage points. Otherwise the PUT is blocked by the regime.
+    "bullish_regime_rel_weakness_pct": 3.0,
+}
+
+# ─────────────────────────────────────────────────────────────
 # GEORGE'S HARD RULES (NEVER VIOLATE — SYSTEM WILL REJECT)
 # ─────────────────────────────────────────────────────────────
 HARD_RULES = {
@@ -163,6 +179,63 @@ CORE_WATCHLIST = [
     "KO", "JPM", "XOM", "GLW", "AMKR", "ANET", "IREN",
     "ONTO", "ENTG",
 ]
+
+# ─────────────────────────────────────────────────────────────
+# SECTOR / THEME GROUPS (Phase 3C — Sector Strength Engine)
+# Every CORE_WATCHLIST symbol maps to one group. Dynamic-watchlist symbols
+# that are not listed here fall through to "UNCLASSIFIED" and are treated as
+# NEUTRAL (never preferred, never penalised). Used to rank themes vs SPY/QQQ
+# before ranking individual stocks.
+# ─────────────────────────────────────────────────────────────
+SECTOR_GROUPS = {
+    "AI_SEMIS":           ["NVDA", "AMD", "AVGO", "MU", "AMKR", "ONTO", "ENTG", "ANET", "GLW", "IREN"],
+    "SOFTWARE_CLOUD":     ["MSFT", "ORCL", "PLTR", "NOW", "CRWD", "PANW", "GOOG", "META"],
+    "FINANCIALS":         ["JPM", "HOOD"],
+    "INDUSTRIALS":        ["CAT"],
+    "CONSUMER_DEFENSIVE": ["WMT", "COST", "KO", "TMUS", "NFLX", "UBER", "TSLA"],
+    "ENERGY":             ["XOM"],
+    "HEALTHCARE":         ["AMGN"],
+}
+
+# Sector-strength ranking + gating thresholds.
+SECTOR_STRENGTH = {
+    "enabled":                True,
+    "lookback_days":          21,     # ~1 month trailing return window
+    "strong_rel_threshold":   2.0,    # sector beats the SPY/QQQ blend by >= 2% → STRONG
+    "weak_rel_threshold":     2.0,    # sector trails the blend by >= 2% → WEAK
+    # How to treat a setup that trades AGAINST sector strength
+    # (a CALL in a WEAK sector, or a PUT in a STRONG sector):
+    "contra_action":          "REDUCE",  # "REDUCE" (size down) or "REJECT" (block)
+    "contra_size_multiplier": 0.5,        # size factor when contra_action == "REDUCE"
+}
+
+# ─────────────────────────────────────────────────────────────
+# OPTIONS LIQUIDITY FILTER (Phase 3D)
+# Final pre-execution gate: reject illiquid / untradeable option contracts and
+# prefer the most liquid near-the-money contract among candidates.
+# ─────────────────────────────────────────────────────────────
+OPTIONS_LIQUIDITY = {
+    "enabled":              True,
+    "max_spread_pct":       0.10,   # bid/ask spread <= 10% of mid passes...
+    "max_spread_abs":       0.15,   # ...OR <= $0.15 absolute, but ONLY for cheap contracts
+    "cheap_mid_threshold":  1.50,   # the absolute-spread rescue applies only when mid <= this
+    "min_open_interest":    100,    # reject if OI is reported and below this
+    "min_option_volume":    10,     # reject if daily option volume is reported and below this
+    "min_bid":              0.05,   # bid must be at least this (rejects no-bid contracts)
+
+    # Data-availability policy. A valid live quote (bid > 0, ask > bid) is always
+    # required. Open interest is NOT exposed by the Alpaca snapshot model, so by
+    # default missing OI/volume data does not hard-block (only present-and-low
+    # values reject). Flip these to True to require the data to be present.
+    "require_quote":              True,
+    "require_open_interest_data": False,
+    "require_volume_data":        False,
+
+    # If the snapshot fetch itself errors (e.g. no options market-data
+    # entitlement on the paper account), reject by default (fail-closed). Set to
+    # True to let trades through when liquidity data cannot be retrieved.
+    "fail_open_on_error":   False,
+}
 
 # NORMAL MODE: Low resource scan schedule (3 scans per trading day in CT)
 NORMAL_SCAN_TIMES = ["09:45", "12:00", "14:45"]

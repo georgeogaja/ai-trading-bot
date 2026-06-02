@@ -48,12 +48,19 @@ def build_research_query(symbol: str, technical: dict, macro: dict) -> str:
     return query
 
 
-def research_top_candidates(candidates: list, macro: dict, limit: int = 3) -> list:
+def research_top_candidates(
+    candidates: list, macro: dict, limit: int = 3, cache_only: bool = False
+) -> list:
     """Fetch or reuse cached Perplexity research for the top candidate setups.
 
     Delegates to ai_research.research_symbol, which uses the correct
     OpenAI-compatible Perplexity endpoint and handles DB caching internally.
     Returns {} per symbol on any failure — never raises.
+
+    When cache_only=True, NO live Perplexity call is ever made: cached research
+    is returned if present, otherwise an empty dict. Used by the higher-frequency
+    intraday scans so that scan cadence never increases Perplexity API usage —
+    live fetching stays confined to the opening scan / pre-market window.
     """
     if not candidates:
         return []
@@ -71,7 +78,16 @@ def research_top_candidates(candidates: list, macro: dict, limit: int = 3) -> li
             continue
 
         # Check DB before calling to preserve accurate cached/fresh flag for logging
-        was_cached = bool(get_research_cache(symbol))
+        cached = get_research_cache(symbol)
+        was_cached = bool(cached)
+
+        if cache_only:
+            # Never hit the Perplexity API — reuse cache or skip silently.
+            research = (cached.get("data") if cached else {}) or {}
+            status = "HIT" if was_cached else "SKIPPED (cache-only)"
+            logger.info(f"Research {status} for {symbol}")
+            results.append({"symbol": symbol, "cached": was_cached, "research": research})
+            continue
 
         try:
             from ai_research import research_symbol

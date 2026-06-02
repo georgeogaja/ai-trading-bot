@@ -317,6 +317,30 @@ def notify_runner_closed(
     return _send_discord({"embeds": [embed]})
 
 
+def notify_liquidity_blocked(
+    symbol: str,
+    option_type: str,
+    contract_symbol: str,
+    reason: str,
+    details: str,
+) -> bool:
+    """Post an options-liquidity rejection to Discord."""
+    fields = [
+        {"name": "Ticker", "value": symbol, "inline": True},
+        {"name": "Option Type", "value": option_type, "inline": True},
+        {"name": "Contract", "value": contract_symbol or "N/A", "inline": False},
+        {"name": "Reason", "value": reason, "inline": False},
+        {"name": "Liquidity", "value": details or "N/A", "inline": False},
+    ]
+    embed = _build_embed(
+        f"Liquidity Blocked — {symbol}",
+        description="Option contract rejected by the liquidity filter before execution.",
+        fields=fields,
+        color=COLOR_RED,
+    )
+    return _send_discord({"embeds": [embed]})
+
+
 def notify_runner_summary(runners: list[dict]) -> bool:
     lines = []
     for runner in runners[:5]:
@@ -337,4 +361,85 @@ def notify_runner_summary(runners: list[dict]) -> bool:
 
 def notify_daily_summary(summary: str) -> bool:
     embed = _build_embed("SWING OPTIONS SUMMARY", description=summary, color=COLOR_BLUE)
+    return _send_discord({"embeds": [embed]})
+
+
+def notify_market_regime(
+    regime: str,
+    score: int,
+    spy_trend: str,
+    qqq_trend: str,
+    vix: float | None,
+    vol_source: str,
+    posture: str,
+    reasons: list[str] | None = None,
+) -> bool:
+    """Post the current market regime summary to Discord.
+
+    `regime` is BULLISH / NEUTRAL / BEARISH; `posture` is the plain-English
+    description of what the regime allows (normal longs, reduced size, or
+    longs/calls blocked).
+    """
+    regime = (regime or "NEUTRAL").upper()
+    color = {
+        "BULLISH": COLOR_GREEN,
+        "NEUTRAL": COLOR_GREY,
+        "BEARISH": COLOR_RED,
+    }.get(regime, COLOR_BLUE)
+
+    vix_value = f"{vix:.2f}" if vix is not None else "N/A"
+    fields = [
+        {"name": "Regime", "value": regime, "inline": True},
+        {"name": "Trend Score", "value": f"{score}/6", "inline": True},
+        {"name": vol_source if vol_source != "NONE" else "Volatility",
+         "value": vix_value, "inline": True},
+        {"name": "SPY Trend", "value": spy_trend, "inline": True},
+        {"name": "QQQ Trend", "value": qqq_trend, "inline": True},
+        {"name": "Posture", "value": posture, "inline": False},
+    ]
+    if reasons:
+        fields.append(
+            {"name": "Signals", "value": "\n".join(f"• {r}" for r in reasons), "inline": False}
+        )
+    embed = _build_embed(
+        f"MARKET REGIME: {regime}",
+        description="Overall market regime assessed before scanning individual stocks.",
+        fields=fields,
+        color=color,
+    )
+    return _send_discord({"embeds": [embed]})
+
+
+def notify_sector_strength(
+    strongest: list[tuple[str, dict]],
+    weakest: list[tuple[str, dict]],
+    benchmark: float | None,
+    top_n: int = 3,
+) -> bool:
+    """Post the sector-strength ranking (strongest vs weakest) to Discord.
+
+    `strongest` / `weakest` are lists of (group_name, detail) where detail holds
+    `rank`, `rel` and `return`.
+    """
+    def _fmt(rows: list[tuple[str, dict]]) -> str:
+        lines = []
+        for name, d in rows[:top_n]:
+            rel = d.get("rel")
+            rank = d.get("rank", "NEUTRAL")
+            rel_txt = f"{rel:+.1f}%" if rel is not None else "n/a"
+            lines.append(f"{name} — {rank} ({rel_txt} vs SPY/QQQ)")
+        return "\n".join(lines) if lines else "No ranked sectors."
+
+    bench_txt = f"{benchmark:+.1f}%" if benchmark is not None else "N/A"
+    fields = [
+        {"name": "Strongest Sectors", "value": _fmt(strongest), "inline": False},
+        {"name": "Weakest Sectors", "value": _fmt(weakest), "inline": False},
+        {"name": "Benchmark (SPY/QQQ blend, ~21d)", "value": bench_txt, "inline": True},
+    ]
+    embed = _build_embed(
+        "SECTOR STRENGTH",
+        description="Sector/theme strength vs SPY/QQQ, assessed before ranking stocks.",
+        fields=fields,
+        color=COLOR_BLUE,
+    )
     return _send_discord({"embeds": [embed]})

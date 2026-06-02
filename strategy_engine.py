@@ -14,7 +14,7 @@ from anthropic import Anthropic
 import yfinance as yf
 import ta
 from loguru import logger
-from config import ACCOUNT, HARD_RULES, SIGNAL_WEIGHTS
+from config import ACCOUNT, HARD_RULES, PUT_SUPPORT, SIGNAL_WEIGHTS
 from db import get_active_watchlist, get_mistake_patterns, log_signal
 
 claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -341,13 +341,56 @@ def analyze_stock(symbol: str) -> dict:
         and current_price > float(ema_50) > float(ema_72) > float(ema_125_val)
     )
 
+    # Directional momentum lines (used for PUT/downside confirmation)
+    di_plus  = round(float(latest.get('DI_plus', 0) or 0), 1)
+    di_minus = round(float(latest.get('DI_minus', 0) or 0), 1)
+
+    # Trailing ~21-day return for relative-strength checks vs the market.
+    return_21d = None
+    if len(df) > 21:
+        past_close = df['Close'].iloc[-22]
+        if not pd.isna(past_close) and float(past_close):
+            return_21d = round((current_price - float(past_close)) / float(past_close) * 100, 2)
+
+    # Direction-aware risk/reward. For a CALL the stop sits BELOW entry and the
+    # reward target is overhead resistance; for a PUT the stop sits ABOVE entry
+    # and the reward target is the downside support level. Computing this with
+    # the wrong sign would make a PUT's R/R meaningless, so we branch on the
+    # signal direction.
     stop_loss = option_plan.get('stop_loss_stock_price', current_price)
-    reward_target = max(
-        float(latest.get('resistance_20', current_price * 1.08)),
-        current_price * 1.08,
+    is_bear_setup = signal in ("A+ SHORT", "SHORT")
+    if is_bear_setup:
+        downside_target = min(
+            float(latest.get('support_20', current_price * 0.92)),
+            current_price * 0.92,
+        )
+        risk = max(float(stop_loss) - current_price, 0.01)
+        risk_reward_ratio = round((current_price - downside_target) / risk, 2) if risk > 0 else 0.0
+    else:
+        reward_target = max(
+            float(latest.get('resistance_20', current_price * 1.08)),
+            current_price * 1.08,
+        )
+        risk = max(current_price - float(stop_loss), 0.01)
+        risk_reward_ratio = round((reward_target - current_price) / risk, 2) if risk > 0 else 0.0
+
+    # ── Bearish / PUT qualification (Phase 3B) ────────────────
+    # A PUT only qualifies when the SHORT side is genuinely confirmed, mirroring
+    # how qualifies_aplus gates the LONG side. All conditions are required:
+    #   - PUT support enabled
+    #   - an A+ SHORT signal
+    #   - bearish trend structure (BIAS == BEAR)
+    #   - downside momentum (-DI > +DI)
+    #   - bear score at/above the PUT threshold
+    qualifies_aplus_put = (
+        PUT_SUPPORT.get("enabled", False)
+        and signal == "A+ SHORT"
+        and bear >= PUT_SUPPORT.get("min_put_score", SIGNAL_WEIGHTS["min_score_aplus"])
     )
-    risk = max(current_price - float(stop_loss), 0.01)
-    risk_reward_ratio = round((reward_target - current_price) / risk, 2) if risk > 0 else 0.0
+    if qualifies_aplus_put and PUT_SUPPORT.get("require_bear_bias", True):
+        qualifies_aplus_put = qualifies_aplus_put and bias == "BEAR"
+    if qualifies_aplus_put and PUT_SUPPORT.get("require_downside_momentum", True):
+        qualifies_aplus_put = qualifies_aplus_put and di_minus > di_plus
 
     # Format exactly like George's ThinkorSwim label
     signal_bar = (
@@ -366,7 +409,10 @@ def analyze_stock(symbol: str) -> dict:
         "rsi":              rsi,
         "rsi_momentum":     rsi_momentum,
         "adx":              adx,
+        "di_plus":          di_plus,
+        "di_minus":         di_minus,
         "bias":             bias,
+        "return_21d":       return_21d,
         "vol_status":       vol_status,
         "vol_ratio":        round(float(vol_ratio), 2) if not pd.isna(vol_ratio) else 1.0,
         "rsi_divergence":   divergence,
@@ -380,6 +426,7 @@ def analyze_stock(symbol: str) -> dict:
         "high_52wk":        high_52wk,
         "signal_bar":       signal_bar,
         "qualifies_aplus":  signal == "A+ LONG" and rsi < HARD_RULES["rsi_overbought"],
+        "qualifies_aplus_put": qualifies_aplus_put,
         "suggested_option": option_plan,
     }
 
@@ -439,6 +486,27 @@ def get_claude_trade_plan(symbol: str, technical: dict, macro: dict,
     except Exception as exc:
         logger.debug(f"Perplexity research unavailable for {symbol}: {exc}")
 
+    # Direction-aware guidance. The hard-rejection rules below are long-only;
+    # for a bearish PUT setup they do not apply, so we tell Claude explicitly
+    # what to confirm on the short side instead.
+    suggested_type = technical['suggested_option'].get('option_type', 'CALL')
+    if suggested_type == "PUT":
+        direction_guidance = (
+            "DIRECTION OF THIS SETUP: BEARISH PUT (short side).\n"
+            "This is a swing PUT, NOT a long. The long-only rejection rules below "
+            "(RSI >= 70 blocks longs, macro RED blocks new longs) DO NOT apply here.\n"
+            "Approve only if downside is confirmed: bearish EMA structure "
+            "(price < EMA50 < EMA72 < EMA125), negative directional momentum "
+            "(-DI > +DI), and a credible breakdown level or bearish catalyst.\n"
+            "Strike must be ATM to a maximum of 10% OTM BELOW the current price, and the "
+            "stop loss is a STOCK PRICE ABOVE the entry. Keep option_type = \"PUT\"."
+        )
+    else:
+        direction_guidance = (
+            "DIRECTION OF THIS SETUP: BULLISH CALL (long side). "
+            "Apply all of George's long-only hard rejection rules below."
+        )
+
     prompt = f"""
 You are George's autonomous AI trading agent. You manage a $10,000 swing options account
 connected to Alpaca. You must follow George's strategy EXACTLY.
@@ -446,6 +514,8 @@ connected to Alpaca. You must follow George's strategy EXACTLY.
 ═══════════════════════════════════════════════════
 GEORGE'S STRATEGY — NON-NEGOTIABLE RULES
 ═══════════════════════════════════════════════════
+
+{direction_guidance}
 
 HARD REJECTION CRITERIA (reject trade if ANY are true):
 ✗ RSI >= 70 → NEVER go long (overbought rejection)
@@ -634,6 +704,40 @@ def run_full_scan(macro: dict, account_info: dict) -> dict:
                         "trade_plan": trade_plan,
                     })
                     logger.info(f"🚨 A+ TRADE SIGNAL: {symbol} | Confidence: {trade_plan.get('confidence')}/10")
+
+            # ── Bearish PUT path (Phase 3B) ───────────────────
+            # A confirmed A+ SHORT goes to Claude exactly like a CALL setup.
+            # Macro RED does not block a PUT — a risk-off macro is favorable for
+            # the short side — so PUTs intentionally bypass the long-only
+            # macro_ok gate. Final direction gating happens in the regime layer.
+            elif technical.get('qualifies_aplus_put'):
+                trade_plan = get_claude_trade_plan(symbol, technical, macro, account_info)
+
+                if trade_plan.get('decision') == 'TRADE':
+                    trade_plan = merge_trade_plan_with_suggestion(trade_plan, technical.get('suggested_option', {}))
+                    # Force the short side regardless of any Claude drift, and
+                    # carry volume + (direction-aware) risk/reward to the executor.
+                    for _dst in (trade_plan, trade_plan.get('trade_plan', {})):
+                        if isinstance(_dst, dict):
+                            _dst['option_type'] = "PUT"
+                            _dst['vol_ratio'] = technical.get('vol_ratio', 1.0)
+                            _dst['risk_reward_ratio'] = technical.get('risk_reward_ratio', 0.0)
+                    actionable.append({
+                        "symbol":     symbol,
+                        "technical":  technical,
+                        "trade_plan": trade_plan,
+                    })
+                    logger.info(f"🔻 A+ PUT (SHORT) SIGNAL: {symbol} | Confidence: {trade_plan.get('confidence')}/10")
+
+            # Bearish signal present but downside not confirmed → no PUT.
+            elif technical.get('signal') in ("A+ SHORT", "SHORT"):
+                logger.info(
+                    f"PUT rejected: bearish confirmation failed | {symbol} | "
+                    f"signal={technical.get('signal')} bias={technical.get('bias')} "
+                    f"bear={technical.get('bear_score')} -DI={technical.get('di_minus')} "
+                    f"+DI={technical.get('di_plus')}"
+                )
+
             elif technical.get('signal') == 'LONG' and technical.get('bull_score', 0) >= SIGNAL_WEIGHTS['min_score_long']:
                 watch_candidates.append({
                     "symbol":    symbol,
