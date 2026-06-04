@@ -131,7 +131,7 @@ def find_option_contract_symbol(symbol: str, strike: float, expiry: str, option_
         expiry_date = datetime.strptime(expiry, "%Y-%m-%d")
         contract_type = ContractType.CALL if option_type == "CALL" else ContractType.PUT
         request = GetOptionContractsRequest(
-            underlying_symbol=symbol,
+            underlying_symbols=[symbol],
             expiration_date_gte=(expiry_date - timedelta(days=7)).strftime("%Y-%m-%d"),
             expiration_date_lte=(expiry_date + timedelta(days=7)).strftime("%Y-%m-%d"),
             strike_price_gte=str(strike * 0.95),
@@ -144,6 +144,20 @@ def find_option_contract_symbol(symbol: str, strike: float, expiry: str, option_
         contract_list = getattr(contracts, "option_contracts", []) or []
         if not contract_list:
             logger.warning(f"No option contracts found for {symbol} {strike} {expiry} {option_type}")
+            return None
+
+        # Safety guard: only consider contracts on the requested underlying (the
+        # broker/paper sandbox can return sample contracts that ignore the filter).
+        requested = symbol.strip().upper()
+        contract_list = [
+            c for c in contract_list
+            if str(getattr(c, "underlying_symbol", "") or "").strip().upper() == requested
+        ]
+        if not contract_list:
+            logger.error(
+                f"Option contract underlying mismatch for {symbol} — "
+                f"refusing to return a wrong-underlying contract"
+            )
             return None
 
         best = min(contract_list, key=lambda c: abs(float(c.strike_price) - strike))
@@ -217,7 +231,7 @@ def find_best_option_contract(symbol: str, strike: float, expiry: str, option_ty
         expiry_date = datetime.strptime(expiry, "%Y-%m-%d")
         contract_type = ContractType.CALL if option_type == "CALL" else ContractType.PUT
         request = GetOptionContractsRequest(
-            underlying_symbol=symbol,
+            underlying_symbols=[symbol],
             expiration_date_gte=(expiry_date - timedelta(days=7)).strftime("%Y-%m-%d"),
             expiration_date_lte=(expiry_date + timedelta(days=7)).strftime("%Y-%m-%d"),
             strike_price_gte=str(strike * 0.95),
@@ -231,6 +245,27 @@ def find_best_option_contract(symbol: str, strike: float, expiry: str, option_ty
         if not contract_list:
             logger.warning(f"No option contracts found for {symbol} {strike} {expiry} {option_type}")
             return None
+
+        # Safety guard: never trade a contract on a different underlying than the
+        # one requested. The broker (notably the paper sandbox) can return sample
+        # contracts that ignore the underlying_symbol filter — placing one of those
+        # would be a wrong-ticker order. Reject any candidate whose underlying does
+        # not match before ranking or ordering.
+        requested = symbol.strip().upper()
+        matched = [
+            c for c in contract_list
+            if str(getattr(c, "underlying_symbol", "") or "").strip().upper() == requested
+        ]
+        if not matched:
+            returned = sorted({
+                str(getattr(c, "underlying_symbol", "") or "?").upper() for c in contract_list
+            })
+            logger.error(
+                f"Option contract underlying mismatch for {symbol}: broker returned "
+                f"contracts for {returned} — refusing to trade a wrong-underlying contract"
+            )
+            return None
+        contract_list = matched
 
         symbols = [c.symbol for c in contract_list]
         snapshots = get_option_snapshots(symbols)

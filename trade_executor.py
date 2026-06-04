@@ -369,12 +369,37 @@ def place_options_trade(symbol: str, trade_plan: dict, account: dict, force: boo
         qty = min(qty, contract_ceiling)
     qty = max(0, qty)
     if qty < 1:
-        reason = (
-            f"Contract too expensive for budget: 1 contract ${per_contract_cost:,.0f} "
-            f"exceeds max spend ${budget:,.0f}"
-        )
-        logger.warning(f"Trade rejected: {symbol} | {reason}")
-        return {"success": False, "reason": reason}
+        # 9/10 one-contract rule: a high-conviction (force) setup should still
+        # get a single lot even when the per-trade budget alone can't cover one
+        # contract — BUT only if that one contract fits within (cash − reserve),
+        # so the cash reserve is never breached. This intentionally allows a
+        # 1-lot to exceed the max_per_trade_pct cap, and nothing else: 2+ lots
+        # still obey the budget. Non-force setups keep the strict budget.
+        if force and contract_ceiling != 1:  # respect an explicit 1-contract hard ceiling
+            cash = float(account.get("cash", 0) or 0)
+            reserve = ACCOUNT["total_capital"] * ACCOUNT["reserve_cash_pct"]
+            spendable_after_reserve = cash - reserve
+            if 0 < per_contract_cost <= spendable_after_reserve:
+                qty = 1
+                logger.info(
+                    f"9/10 one-contract rule | {symbol} | budget ${budget:,.0f} can't cover "
+                    f"1 contract (${per_contract_cost:,.0f}), but it fits within cash−reserve "
+                    f"(${spendable_after_reserve:,.0f}) → placing 1 contract"
+                )
+            else:
+                reason = (
+                    f"9/10 one contract ${per_contract_cost:,.0f} exceeds cash after reserve "
+                    f"${spendable_after_reserve:,.0f} — cannot place without breaching reserve"
+                )
+                logger.warning(f"Trade rejected: {symbol} | {reason}")
+                return {"success": False, "reason": reason}
+        else:
+            reason = (
+                f"Contract too expensive for budget: 1 contract ${per_contract_cost:,.0f} "
+                f"exceeds max spend ${budget:,.0f}"
+            )
+            logger.warning(f"Trade rejected: {symbol} | {reason}")
+            return {"success": False, "reason": reason}
     logger.info(
         f"Sizing {symbol}: {qty} contract(s) @ ${limit_price:.2f} "
         f"= ${qty * per_contract_cost:,.0f} of ${budget:,.0f} budget"

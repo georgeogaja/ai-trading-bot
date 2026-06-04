@@ -12,14 +12,16 @@ load_dotenv()
 # ACCOUNT CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 ACCOUNT = {
-    "total_capital":              10_000,    # Total account size
-    "max_per_trade_pct":          0.30,      # Max 30% per trade = $3,000 max deployed (1–2 contracts)
+    "total_capital":              5_000,     # Live paper account cash/equity (NOT the $20k margin BP;
+                                             # long options are paid from cash, and the reserve gate
+                                             # checks cash — so this tracks real spendable capital)
+    "max_per_trade_pct":          0.40,      # Max 40% per trade = $2,000 max deployed
     "max_open_positions":         5,         # Never more than 5 concurrent positions
-    "reserve_cash_pct":           0.30,      # Always keep 30% cash reserve = $3,000
+    "reserve_cash_pct":           0.20,      # Always keep 20% cash reserve = $1,000
     "paper_trading":              True,      # ALWAYS start in paper mode
     "kill_switch_enabled":        True,      # Enable daily loss and trade count protection
-    "max_daily_loss_usd":         1500,      # Stop new trades after this much realized loss in a day
-                                             # (~2 full -15% stops on max-size positions)
+    "max_daily_loss_usd":         1000,      # Stop new trades after this much realized loss in a day
+                                             # (20% of a $5k account)
     "max_trades_per_day":         5,         # Stop new trades after this many fills in a day
     "min_confidence_to_execute":  7,         # Minimum confidence score (1-10) before placing a trade.
                                              # AI mode: Claude's confidence. Deterministic mode: the
