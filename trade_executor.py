@@ -7,10 +7,11 @@ Handles options order placement, position sizing, stop loss, profit targets, and
 import yfinance as yf
 from datetime import datetime
 from loguru import logger
-from config import ACCOUNT, HARD_RULES, OPTIONS_LIQUIDITY, POSITION_SIZING, RISK_REWARD
+from config import ACCOUNT, FORCE_EXECUTION, HARD_RULES, OPTIONS_LIQUIDITY, POSITION_SIZING, RISK_REWARD
 from db import (
     log_trade_entry,
     update_trade_exit,
+    update_trade_fields,
     get_open_trades,
     log_runner_entry,
     update_runner,
@@ -86,10 +87,16 @@ def determine_volume_size_tier(vol_ratio: float) -> dict:
     return {"action": "WATCH", "size_multiplier": 0.0, "tier": "WATCH_ONLY"}
 
 
-def validate_trade(symbol: str, trade_plan: dict, account: dict) -> tuple:
+def validate_trade(symbol: str, trade_plan: dict, account: dict, force: bool = False) -> tuple:
     """
     Validate a trade against George's hard rules and account constraints.
     Returns (is_valid: bool, reason: str)
+
+    `force` is True for a 9/10 force-execution attempt. It bypasses ONLY the
+    SOFT gates (low/moderate volume, borderline risk/reward above the hard
+    floor). Every HARD safety control below — kill switch, reserve cash, buying
+    power, max open positions, position-size cap, the absolute R/R hard floor,
+    OTM cap, stop-loss requirement — is enforced regardless of `force`.
     """
     if not trade_plan:
         return False, "Trade plan missing"
@@ -108,23 +115,38 @@ def validate_trade(symbol: str, trade_plan: dict, account: dict) -> tuple:
     risk_reward = float(plan.get("risk_reward_ratio", 0) or 0)
 
     # Volume gate — below the reduced-size floor we never trade (watch only).
+    # SOFT: a 9/10 force attempt bypasses this (size is already reduced upstream).
     if vol_ratio < POSITION_SIZING["volume_reduced_min"]:
-        return False, (
-            f"Volume too low: {vol_ratio:.2f}x below "
-            f"{POSITION_SIZING['volume_reduced_min']:.2f}x — watch only"
-        )
+        if force:
+            logger.info(
+                f"Soft gate bypassed due to 9/10 | {symbol} | volume "
+                f"{vol_ratio:.2f}x below {POSITION_SIZING['volume_reduced_min']:.2f}x"
+            )
+        else:
+            return False, (
+                f"Volume too low: {vol_ratio:.2f}x below "
+                f"{POSITION_SIZING['volume_reduced_min']:.2f}x — watch only"
+            )
 
-    # Risk/reward gates — absolute floor first, then the standard minimum.
+    # Risk/reward gates — absolute floor first (HARD, never bypassed), then the
+    # standard minimum (SOFT: a 9/10 may proceed if it is above the hard floor).
     if risk_reward < RISK_REWARD["hard_floor"]:
         return False, (
             f"Risk/reward {risk_reward:.2f} below absolute floor "
             f"{RISK_REWARD['hard_floor']:.2f} — never trade"
         )
     if risk_reward < RISK_REWARD["min_to_execute"]:
-        return False, (
-            f"Risk/reward {risk_reward:.2f} below minimum "
-            f"{RISK_REWARD['min_to_execute']:.2f}"
-        )
+        if force:
+            logger.info(
+                f"Soft gate bypassed due to 9/10 | {symbol} | risk/reward "
+                f"{risk_reward:.2f} below minimum {RISK_REWARD['min_to_execute']:.2f} "
+                f"(above hard floor {RISK_REWARD['hard_floor']:.2f})"
+            )
+        else:
+            return False, (
+                f"Risk/reward {risk_reward:.2f} below minimum "
+                f"{RISK_REWARD['min_to_execute']:.2f}"
+            )
 
     if max_spend <= 0:
         return False, "Trade size estimate missing"
@@ -147,13 +169,17 @@ def validate_trade(symbol: str, trade_plan: dict, account: dict) -> tuple:
         return False, f"Max positions reached: {open_pos}/{ACCOUNT['max_open_positions']}"
 
     if strike_pct > HARD_RULES["max_otm_pct"] * 100:
-        return False, f"Strike too far OTM: {strike_pct:.1f}% exceeds 15% limit"
+        return False, (
+            f"Strike too far OTM: {strike_pct:.1f}% exceeds "
+            f"{HARD_RULES['max_otm_pct'] * 100:.0f}% limit"
+        )
 
     if not plan.get("stop_loss_stock_price"):
         return False, "No stop loss defined — trade rejected"
 
-    if int(plan.get("contracts", 1)) > HARD_RULES["max_contracts"]:
-        return False, "Max 1 contract per trade"
+    contract_ceiling = int(HARD_RULES.get("max_contracts", 0) or 0)
+    if contract_ceiling > 0 and int(plan.get("contracts", 1)) > contract_ceiling:
+        return False, f"Exceeds max {contract_ceiling} contracts per trade"
 
     return True, "All checks passed"
 
@@ -221,13 +247,20 @@ def get_adaptive_active_interval() -> int:
     return interval
 
 
-def place_options_trade(symbol: str, trade_plan: dict, account: dict) -> dict:
-    """Validate and place an options trade in Alpaca paper trading."""
+def place_options_trade(symbol: str, trade_plan: dict, account: dict, force: bool = False) -> dict:
+    """Validate and place an options trade in Alpaca paper trading.
+
+    `force` carries the 9/10 force-execution flag down from the scheduler. It
+    only relaxes SOFT filters (low/moderate volume, borderline R/R above the
+    hard floor). The liquidity gate, contract/underlying validation, sizing
+    math, and every hard rule in validate_trade remain fully enforced.
+    """
     plan = resolve_trade_plan(trade_plan)
 
-    # Volume-based position sizing. Below the reduced floor is watch-only and
-    # never reaches order placement; the reduced tier halves the dollar risk
-    # allocation (contracts stay at 1 per George's hard rule).
+    # Volume-based position sizing. Below the reduced floor is normally
+    # watch-only and never reaches order placement; the reduced tier halves the
+    # dollar risk allocation (contracts stay at 1 per George's hard rule).
+    # SOFT for a 9/10: instead of blocking, reduce size and proceed.
     vol_ratio = float(plan.get("vol_ratio", 0) or 0)
     size_tier = determine_volume_size_tier(vol_ratio)
     if size_tier["action"] == "WATCH":
@@ -235,15 +268,26 @@ def place_options_trade(symbol: str, trade_plan: dict, account: dict) -> dict:
             f"Volume {vol_ratio:.2f}x below "
             f"{POSITION_SIZING['volume_reduced_min']:.2f}x — watch only, no trade"
         )
-        logger.info(f"Watch only: {symbol} | {reason}")
-        notify_risk_blocked(
-            symbol,
-            plan.get("option_type", "Unknown"),
-            reason,
-            "Volume below tradeable threshold",
-            "Monitor for a volume expansion before considering an entry.",
-        )
-        return {"success": False, "reason": reason}
+        if force:
+            logger.info(
+                f"Soft gate bypassed due to 9/10 | {symbol} | {reason} → "
+                f"reducing size instead of blocking"
+            )
+            size_tier = {
+                "action": "TRADE",
+                "size_multiplier": float(POSITION_SIZING["reduced_size_multiplier"]),
+                "tier": "FORCED_REDUCED",
+            }
+        else:
+            logger.info(f"Watch only: {symbol} | {reason}")
+            notify_risk_blocked(
+                symbol,
+                plan.get("option_type", "Unknown"),
+                reason,
+                "Volume below tradeable threshold",
+                "Monitor for a volume expansion before considering an entry.",
+            )
+            return {"success": False, "reason": reason}
 
     if size_tier["size_multiplier"] != 1.0:
         base_spend = float(plan.get("max_to_spend", 0) or 0)
@@ -253,7 +297,7 @@ def place_options_trade(symbol: str, trade_plan: dict, account: dict) -> dict:
             f"max_to_spend ${base_spend:.2f} → ${plan['max_to_spend']:.2f}"
         )
 
-    is_valid, reason = validate_trade(symbol, plan, account)
+    is_valid, reason = validate_trade(symbol, plan, account, force=force)
     if not is_valid:
         logger.warning(f"Trade rejected: {symbol} | {reason}")
         notify_risk_blocked(
@@ -310,11 +354,47 @@ def place_options_trade(symbol: str, trade_plan: dict, account: dict) -> dict:
         limit_price = round(float(mid), 2)
         logger.info(f"Limit price set from live mid for {contract_symbol}: ${limit_price}")
 
-    order_result = place_option_order(contract_symbol, 1, limit_price)
+    # Size the order from the dollar budget — buy as many contracts as the
+    # per-trade spend allows (one contract = 100 shares of premium exposure).
+    # HARD_RULES['max_contracts'] is an optional safety ceiling (0 = unlimited).
+    # The volume-tier reduction above is already baked into max_to_spend, so a
+    # reduced tier naturally lands on fewer contracts.
+    budget = float(plan.get("max_to_spend", 0) or 0)
+    per_contract_cost = limit_price * 100
+    if per_contract_cost <= 0:
+        return {"success": False, "reason": "Invalid option price for contract sizing"}
+    qty = int(budget // per_contract_cost)
+    contract_ceiling = int(HARD_RULES.get("max_contracts", 0) or 0)
+    if contract_ceiling > 0:
+        qty = min(qty, contract_ceiling)
+    qty = max(0, qty)
+    if qty < 1:
+        reason = (
+            f"Contract too expensive for budget: 1 contract ${per_contract_cost:,.0f} "
+            f"exceeds max spend ${budget:,.0f}"
+        )
+        logger.warning(f"Trade rejected: {symbol} | {reason}")
+        return {"success": False, "reason": reason}
+    logger.info(
+        f"Sizing {symbol}: {qty} contract(s) @ ${limit_price:.2f} "
+        f"= ${qty * per_contract_cost:,.0f} of ${budget:,.0f} budget"
+    )
+
+    order_result = place_option_order(contract_symbol, qty, limit_price)
     if not order_result.get("success"):
         return order_result
 
     entry_price = account.get("current_price") or fetch_current_stock_price(symbol)
+
+    # Derive profit targets deterministically from the ACTUAL fill premium and
+    # the configured gains, rather than trusting AI estimates. This guarantees
+    # the first scale-out fires at +HARD_RULES['target_1_gain'] (e.g. +30%) and
+    # the runner target at +target_2_gain — the win-rate exit discipline.
+    target_1_price = round(limit_price * (1 + HARD_RULES["target_1_gain"]), 2) if limit_price > 0 \
+        else plan.get("target_1_option_price")
+    target_2_price = round(limit_price * (1 + HARD_RULES["target_2_gain"]), 2) if limit_price > 0 \
+        else plan.get("target_2_option_price")
+
     trade_id = log_trade_entry({
         "symbol": symbol,
         "option_symbol": contract_symbol,
@@ -323,11 +403,11 @@ def place_options_trade(symbol: str, trade_plan: dict, account: dict) -> dict:
         "entry_stock_price": entry_price,
         "strike": strike,
         "expiry": expiry,
-        "contracts": 1,
+        "contracts": qty,
         "entry_option_price": limit_price,
         "stop_loss_level": plan.get("stop_loss_stock_price"),
-        "target_1": plan.get("target_1_option_price"),
-        "target_2": plan.get("target_2_option_price"),
+        "target_1": target_1_price,
+        "target_2": target_2_price,
         "catalyst": plan.get("catalyst"),
         "thesis": plan.get("thesis"),
         "alpaca_order_id": str(order_result.get("order_id")),
@@ -340,9 +420,9 @@ def place_options_trade(symbol: str, trade_plan: dict, account: dict) -> dict:
         expiry=expiry,
         entry_premium=limit_price,
         stop_loss_premium=float(plan.get("stop_loss_option_price", 0) or 0),
-        profit_target_premium=float(plan.get("target_1_option_price", 0) or 0),
-        max_risk=float(plan.get("max_to_spend", 0) or 0),
-        position_size=f"{int(plan.get('contracts', 1))} contract(s) ({size_tier['tier']} size, vol {vol_ratio:.2f}x)",
+        profit_target_premium=float(target_1_price or 0),
+        max_risk=round(qty * per_contract_cost, 2),
+        position_size=f"{qty} contract(s) ({size_tier['tier']} size, vol {vol_ratio:.2f}x)",
         expected_hold=f"Until expiration or invalidation, typically a multi-week swing",
         reason=plan.get("thesis", "Confirmed swing options setup."),
         exit_plan=plan.get("exit_plan", "Exit at target or on invalidation."),
@@ -394,12 +474,33 @@ def monitor_open_positions():
         # would stop every PUT out immediately, so branch on the trade type.
         trade_type = str(trade.get('trade_type') or 'CALL').upper()
         if trade_type == 'PUT':
-            stop_hit = bool(stop) and current_stock >= stop
+            stock_stop_hit = bool(stop) and current_stock >= stop
         else:
-            stop_hit = bool(stop) and current_stock <= stop
+            stock_stop_hit = bool(stop) and current_stock <= stop
+
+        # Hard premium stop: cap the loss on the option itself at
+        # HARD_RULES['max_option_loss_pct'] (e.g. 15%), independent of the
+        # stock-based stop. Premium falls when a CALL or a PUT loses, so this is
+        # direction-agnostic. This is the "can't lose more than 15%" guarantee
+        # (subject to fills/gaps).
+        entry_option_chk = float(trade.get('entry_option_price') or 0)
+        max_loss_pct = float(HARD_RULES.get("max_option_loss_pct", 0) or 0)
+        option_stop_hit = bool(
+            max_loss_pct and entry_option_chk and current_option_price > 0
+            and current_option_price <= entry_option_chk * (1 - max_loss_pct)
+        )
+
+        stop_hit = stock_stop_hit or option_stop_hit
+        stop_label = "OPTION_HARD_STOP" if (option_stop_hit and not stock_stop_hit) else "STOP_LOSS"
 
         if stop_hit:
-            logger.warning(f"🚨 STOP LOSS: {symbol} @ ${current_stock:.2f} | stop ${stop:.2f}")
+            if stop_label == "OPTION_HARD_STOP":
+                logger.warning(
+                    f"🚨 OPTION HARD STOP (-{max_loss_pct:.0%}): {symbol} "
+                    f"@ ${current_option_price:.2f} (entry ${entry_option_chk:.2f})"
+                )
+            else:
+                logger.warning(f"🚨 STOP LOSS: {symbol} @ ${current_stock:.2f} | stop ${stop:.2f}")
             exit_pnl = 0.0
             if trade.get('entry_option_price') is not None:
                 entry_option = float(trade.get('entry_option_price') or 0)
@@ -411,7 +512,7 @@ def monitor_open_positions():
                     "exit_stock_price": current_stock,
                     "exit_option_price": current_option_price,
                     "status": "STOPPED",
-                    "exit_reason": "STOP_LOSS",
+                    "exit_reason": stop_label,
                 })
                 record_trade_outcome(trade['id'])
                 entry_option = float(trade.get('entry_option_price') or 0)
@@ -421,7 +522,7 @@ def monitor_open_positions():
                 notify_trade_exited(
                     symbol,
                     trade.get('trade_type', 'Option'),
-                    "Stop loss",
+                    f"Hard stop (-{max_loss_pct:.0%} premium)" if stop_label == "OPTION_HARD_STOP" else "Stop loss",
                     entry_option,
                     current_option_price,
                     percent_return,
@@ -431,6 +532,32 @@ def monitor_open_positions():
             else:
                 logger.critical(f"LIVE STOP ALERT: {symbol} — review immediately")
             continue
+
+        # ── Breakeven stop trail ──────────────────────────────
+        # Once the option is up by HARD_RULES['breakeven_trigger_gain'] (e.g.
+        # +20%), pull the stock stop up to the entry price so a winner can't turn
+        # into a loser. Direction-aware and idempotent: only tightens the stop
+        # (never loosens it) and only persists when it actually moves.
+        entry_option = float(trade.get('entry_option_price') or 0)
+        entry_stock = trade.get('entry_stock_price')
+        if entry_option and entry_stock and current_option_price:
+            gain = (current_option_price - entry_option) / entry_option
+            if gain >= HARD_RULES.get("breakeven_trigger_gain", 0.20):
+                entry_stock = float(entry_stock)
+                if trade_type == 'PUT':
+                    # PUT stop sits ABOVE price; breakeven tightens it DOWN to entry.
+                    moves = stop is None or entry_stock < float(stop)
+                else:
+                    # CALL stop sits BELOW price; breakeven tightens it UP to entry.
+                    moves = stop is None or entry_stock > float(stop)
+                if moves:
+                    update_trade_fields(trade['id'], {"stop_loss_level": entry_stock})
+                    logger.info(
+                        f"🔒 Breakeven stop: {symbol} {trade_type} up {gain:+.0%} "
+                        f"| stop → ${entry_stock:.2f} (was "
+                        f"{('$' + format(float(stop), '.2f')) if stop else 'n/a'})"
+                    )
+                    stop = entry_stock  # use the tightened stop for the rest of this pass
 
         if current_option_price and trade.get('entry_option_price'):
             if target_2 and current_option_price >= target_2:

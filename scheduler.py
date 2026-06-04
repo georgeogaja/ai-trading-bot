@@ -2,7 +2,10 @@
 
 Schedules all recurring tasks:
   - Pre-market macro briefing        08:00 CT  Mon-Fri
-  - Normal A+ watchlist scans        every 30 min, 09:30–15:30 CT  Mon-Fri
+  - Normal A+ watchlist scans        every 30 min, 08:30–16:00 ET  Mon-Fri
+                                     (starts 1h before the open; pre-open scans
+                                      screen only and never place trades)
+  - Daily zone-marking watchlist     20:00 ET Sun-Thu + 06:00 ET Mon-Fri
   - Watch mode monitor               every 20 min (adaptive)
   - Active trade monitor             every 10 min (adaptive)
   - After-hours intelligence scan    16:30 CT  Mon-Fri
@@ -13,26 +16,45 @@ DRY_RUN is respected throughout: scans always run, trade placement is skipped.
 """
 from pathlib import Path
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from loguru import logger
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from alpaca_broker import is_kill_switch_engaged
-from config import ACCOUNT, CT_TIMEZONE, PUT_SUPPORT
+from config import (
+    ACCOUNT,
+    HARD_RULES,
+    CT_TIMEZONE,
+    ET_TIMEZONE,
+    MARKET_OPEN_ET,
+    MARKET_CLOSE_ET,
+    SCAN_PREOPEN_LEAD_MIN,
+    SCAN_INTERVAL_MIN,
+    SCAN_OPEN_POWER_INTERVAL_MIN,
+    SCAN_OPEN_POWER_DURATION_MIN,
+    WATCHLIST_ALERT_EVENING_ET,
+    WATCHLIST_ALERT_MORNING_ET,
+    PUT_SUPPORT,
+    FORCE_EXECUTION,
+)
 from db import get_mistake_patterns
 from market_intelligence import get_macro_data, run_market_intelligence
 from market_regime import BEARISH, BULLISH, NEUTRAL, get_market_regime, log_regime
 from sector_strength import get_sector_strength, log_sector_strength
+from zone_logic import evaluate_zone_alignment, log_zone_alignment
+from config import ZONE_LOGIC
 from notifier import (
     notify_daily_summary,
+    notify_daily_watchlist,
     notify_market_regime,
     notify_sector_strength,
     notify_watch_mode,
     send_discord_message,
 )
 from state_manager import state_manager
-from strategy_engine import run_full_scan
+from strategy_engine import run_full_scan, get_days_to_earnings
 from trade_executor import (
     get_account_status,
     get_adaptive_active_interval,
@@ -55,20 +77,60 @@ _last_regime: str | None = None
 # re-posts when the leadership changes (the opening scan always posts).
 _last_sector_key: tuple | None = None
 
-# Normal-scan cadence: every 30 min during market hours, 09:30–15:30 CT inclusive.
-_SCAN_START = (9, 30)
-_SCAN_END = (15, 30)
-_SCAN_INTERVAL_MIN = 30
+# Eastern timezone object for market-relative scheduling and the pre-open guard.
+_ET = ZoneInfo(ET_TIMEZONE)
+
+# Normal-scan cadence (Eastern time): every SCAN_INTERVAL_MIN minutes, starting
+# SCAN_PREOPEN_LEAD_MIN before the open (default 08:30 ET) through the close
+# (default 16:00 ET), inclusive. The pre-open slots screen only — execution is
+# deferred to regular trading hours by _is_pre_market_et() inside _run_normal_scan.
+_SCAN_START = (
+    datetime(2000, 1, 1, *MARKET_OPEN_ET) - timedelta(minutes=SCAN_PREOPEN_LEAD_MIN)
+)
+_SCAN_START = (_SCAN_START.hour, _SCAN_START.minute)
+_SCAN_END = tuple(MARKET_CLOSE_ET)
+_SCAN_INTERVAL_MIN = SCAN_INTERVAL_MIN
+
+
+def _is_pre_market_et() -> bool:
+    """True when the current Eastern time is before the regular open (09:30 ET)."""
+    now = datetime.now(_ET)
+    return (now.hour, now.minute) < tuple(MARKET_OPEN_ET)
+
+
+def _slot_range(start: tuple[int, int], end: tuple[int, int], step_min: int) -> list[tuple[int, int]]:
+    """(hour, minute) slots from start to end inclusive at a fixed minute step."""
+    out = []
+    cursor = datetime(2000, 1, 1, *start)
+    stop = datetime(2000, 1, 1, *end)
+    while cursor <= stop:
+        out.append((cursor.hour, cursor.minute))
+        cursor += timedelta(minutes=step_min)
+    return out
 
 
 def _normal_scan_times() -> list[tuple[int, int]]:
-    """Return (hour, minute) slots every 30 min from 09:30 to 15:30 CT inclusive."""
-    slots = []
-    cursor = datetime(2000, 1, 1, *_SCAN_START)
-    end = datetime(2000, 1, 1, *_SCAN_END)
-    while cursor <= end:
-        slots.append((cursor.hour, cursor.minute))
-        cursor += timedelta(minutes=_SCAN_INTERVAL_MIN)
+    """ET scan slots: baseline 30-min grid with a faster 5-min opening power hour.
+
+    The baseline grid runs every SCAN_INTERVAL_MIN across the whole window
+    (08:30–16:00 ET). On top of that, the first SCAN_OPEN_POWER_DURATION_MIN
+    after the open (09:30–10:30 ET) is overlaid at SCAN_OPEN_POWER_INTERVAL_MIN
+    so the bot actively hunts entries while the morning move is fresh. The two
+    sets are merged and de-duplicated, so e.g. 09:30/10:00/10:30 appear once.
+    """
+    baseline = _slot_range(_SCAN_START, _SCAN_END, _SCAN_INTERVAL_MIN)
+
+    power_end = (
+        datetime(2000, 1, 1, *MARKET_OPEN_ET)
+        + timedelta(minutes=SCAN_OPEN_POWER_DURATION_MIN)
+    )
+    power = _slot_range(
+        tuple(MARKET_OPEN_ET),
+        (power_end.hour, power_end.minute),
+        SCAN_OPEN_POWER_INTERVAL_MIN,
+    )
+
+    slots = sorted(set(baseline) | set(power))
     return slots
 
 
@@ -82,6 +144,80 @@ def _journal(message: str) -> None:
     line = f"{datetime.now().isoformat()} | {message}\n"
     with _JOURNAL_FILE.open("a", encoding="utf-8") as f:
         f.write(line)
+
+
+# ─────────────────────────────────────────────────────────────
+# DAILY WATCHLIST NOTIFICATION (zone-marking heads-up)
+# ─────────────────────────────────────────────────────────────
+
+def _zone_label_for_bias(bias: str) -> str:
+    """Map a directional bias to the TradingView zone-marking instruction."""
+    return {
+        "CALL": "mark DEMAND zones",
+        "PUT": "mark SUPPLY zones",
+    }.get(bias, "mark BOTH")
+
+
+def _build_watchlist_entries(
+    actionable: list[dict],
+    watch_candidates: list[dict],
+    sectors,
+    top_n: int = 8,
+) -> list[dict]:
+    """Assemble the bot's own top screened picks into watchlist entries.
+
+    Read-only over the scan results — it never touches execution, sizing or any
+    gate. Actionable A+ signals (already ranked) come first as primary picks
+    with their AI confidence; filtered watch candidates fill the remainder as
+    secondary picks with their technical screen score. Each entry carries the
+    bias, sector/theme, confidence and a brief reason, plus the zone-marking
+    label the human acts on in TradingView.
+    """
+    entries: list[dict] = []
+    seen: set[str] = set()
+
+    for sig in actionable:
+        symbol = sig.get("symbol")
+        if not symbol or symbol in seen:
+            continue
+        plan = sig.get("trade_plan", {}) or {}
+        technical = sig.get("technical", {}) or {}
+        opt = str(plan.get("option_type") or "").upper()
+        bias = opt if opt in ("CALL", "PUT") else "NEUTRAL"
+        reason = plan.get("thesis") or technical.get("signal") or "A+ technical setup"
+        entries.append({
+            "symbol": symbol,
+            "bias": bias,
+            "zone_label": _zone_label_for_bias(bias),
+            "sector": sectors.group_for(symbol),
+            "sector_rank": sectors.rank_for(symbol),
+            "confidence_display": f"{int(plan.get('confidence', 0) or 0)}/10",
+            "reason": reason,
+        })
+        seen.add(symbol)
+
+    for wc in watch_candidates:
+        symbol = wc.get("symbol")
+        if not symbol or symbol in seen:
+            continue
+        technical = wc.get("technical", {}) or {}
+        option_plan = wc.get("option_plan", technical.get("suggested_option", {})) or {}
+        opt = str(option_plan.get("option_type") or "").upper()
+        bias = opt if opt in ("CALL", "PUT") else "NEUTRAL"
+        reasons = wc.get("reasons") or []
+        reason = ", ".join(reasons) if reasons else technical.get("signal", "Watch candidate")
+        entries.append({
+            "symbol": symbol,
+            "bias": bias,
+            "zone_label": _zone_label_for_bias(bias),
+            "sector": sectors.group_for(symbol),
+            "sector_rank": sectors.rank_for(symbol),
+            "confidence_display": f"score {wc.get('score', technical.get('bull_score', 'n/a'))} (watch)",
+            "reason": reason,
+        })
+        seen.add(symbol)
+
+    return entries[:top_n]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -134,6 +270,18 @@ def _run_normal_scan(dry_run: bool, research_live: bool = False) -> None:
     """
     logger.info("NORMAL SCAN starting")
     min_confidence = ACCOUNT.get("min_confidence_to_execute", 8)
+
+    # Pre-open scans (before 09:30 ET) screen only: route them through the
+    # existing DRY_RUN path so they evaluate signals and feed watch mode without
+    # placing any trades. This keeps execution strictly within regular trading
+    # hours even though scanning now starts an hour before the open.
+    if not dry_run and _is_pre_market_et():
+        logger.info(
+            "Pre-market scan (before 09:30 ET) — screening only; "
+            "execution deferred to regular trading hours"
+        )
+        _journal("PRE-MARKET SCAN | screening only, no execution")
+        dry_run = True
 
     try:
         # ── 1. Account health ─────────────────────────────────
@@ -267,7 +415,7 @@ def _run_normal_scan(dry_run: bool, research_live: bool = False) -> None:
 
         # ── 6. Trade execution ────────────────────────────────
         executed = skipped_confidence = skipped_dryrun = rejected = 0
-        blocked_regime = blocked_sector = 0
+        blocked_regime = blocked_sector = blocked_zone = blocked_earnings = 0
 
         for signal in actionable:
             symbol = signal.get("symbol")
@@ -285,17 +433,46 @@ def _run_normal_scan(dry_run: bool, research_live: bool = False) -> None:
             #                weak relative to the market.
             is_put = option_type == "PUT"
 
+            # ── 9/10 FORCE EXECUTION ATTEMPT ─────────────────────
+            # A setup graded at/above FORCE_EXECUTION['min_confidence'] MUST be
+            # carried through to an order attempt. The SOFT gates below (regime,
+            # sector, zone, neutral-bump confidence) only log a bypass instead of
+            # routing the setup to WATCH. HARD safety gates (earnings, and every
+            # check inside place_options_trade / validate_trade) still apply.
+            force = (
+                bool(FORCE_EXECUTION.get("enabled", True))
+                and confidence >= int(FORCE_EXECUTION.get("min_confidence", 9))
+            )
+            if force:
+                fmsg = (
+                    f"🔥 9/10 FORCE EXECUTION ATTEMPT | {symbol} | {option_type} | "
+                    f"confidence={confidence}/10"
+                )
+                logger.info(fmsg)
+                _journal(fmsg)
+                send_discord_message(fmsg)
+
             if not is_put and regime.blocks_long_calls and option_type in ("CALL", "LONG"):
-                logger.info(
-                    f"BLOCKED {symbol} | MARKET REGIME: {regime.regime} — "
-                    f"aggressive long/call setups blocked"
-                )
-                _journal(
-                    f"REGIME BLOCK ({regime.regime}): {symbol} | {option_type} | "
-                    f"thesis={str(trade_plan.get('thesis', ''))[:80]}"
-                )
-                blocked_regime += 1
-                continue
+                if force:
+                    logger.info(
+                        f"Soft gate bypassed due to 9/10 | {symbol} | market regime "
+                        f"{regime.regime} (long/call) — proceeding (size reduced)"
+                    )
+                    send_discord_message(
+                        f"⚙️ Soft gate bypassed due to 9/10 | {symbol} | market regime "
+                        f"{regime.regime}"
+                    )
+                else:
+                    logger.info(
+                        f"BLOCKED {symbol} | MARKET REGIME: {regime.regime} — "
+                        f"aggressive long/call setups blocked"
+                    )
+                    _journal(
+                        f"REGIME BLOCK ({regime.regime}): {symbol} | {option_type} | "
+                        f"thesis={str(trade_plan.get('thesis', ''))[:80]}"
+                    )
+                    blocked_regime += 1
+                    continue
 
             if is_put:
                 technical = signal.get("technical", {})
@@ -318,11 +495,21 @@ def _run_normal_scan(dry_run: bool, research_live: bool = False) -> None:
                             f"{rel_strength if rel_strength is not None else 'n/a'}% "
                             f"(needs <= {weakness_floor}%)"
                         )
-                        logger.info(msg)
-                        _journal(f"REGIME BLOCK (BULLISH PUT): {symbol} | {msg}")
-                        send_discord_message(f"🔻 {msg}")
-                        blocked_regime += 1
-                        continue
+                        if force:
+                            logger.info(
+                                f"Soft gate bypassed due to 9/10 | {symbol} | "
+                                f"PUT in bullish regime — proceeding (size reduced)"
+                            )
+                            send_discord_message(
+                                f"⚙️ Soft gate bypassed due to 9/10 | {symbol} | "
+                                f"PUT in bullish regime"
+                            )
+                        else:
+                            logger.info(msg)
+                            _journal(f"REGIME BLOCK (BULLISH PUT): {symbol} | {msg}")
+                            send_discord_message(f"🔻 {msg}")
+                            blocked_regime += 1
+                            continue
                     approve = (
                         f"PUT setup approved | {symbol} | clearly weak vs market "
                         f"(rel {rel_strength}%) despite BULLISH regime"
@@ -356,24 +543,112 @@ def _run_normal_scan(dry_run: bool, research_live: bool = False) -> None:
                     f"{option_type} rejected by sector strength | {symbol} | "
                     f"{sector_gate['group']} is {sector_gate['rank']}"
                 )
-                logger.info(msg)
-                send_discord_message(f"🚫 {msg}")
-                blocked_sector += 1
-                continue
+                if force:
+                    logger.info(
+                        f"Soft gate bypassed due to 9/10 | {symbol} | sector "
+                        f"{sector_gate['group']} {sector_gate['rank']} — proceeding (size reduced)"
+                    )
+                    send_discord_message(
+                        f"⚙️ Soft gate bypassed due to 9/10 | {symbol} | sector "
+                        f"{sector_gate['group']} {sector_gate['rank']}"
+                    )
+                else:
+                    logger.info(msg)
+                    send_discord_message(f"🚫 {msg}")
+                    blocked_sector += 1
+                    continue
 
-            # Gate 1: confidence threshold (raised in NEUTRAL regimes)
-            if confidence < effective_min_confidence:
+            # Gate 0c: supply/demand zone alignment (Phase 4B). Consumes the
+            # zones stored by the Phase 4A TradingView receiver. Uses the nearest
+            # active, non-stale zone for the symbol to:
+            #   CALL → prefer DEMAND, reject if too close to SUPPLY, boost near DEMAND
+            #   PUT  → prefer SUPPLY, reject if too close to DEMAND, boost near SUPPLY
+            # A REJECT stops here; a PREFER nudges the confidence used by Gate 1.
+            current_price = (signal.get("technical", {}) or {}).get("price")
+            zone_eval = evaluate_zone_alignment(option_type, symbol, current_price)
+            log_zone_alignment(symbol, option_type, zone_eval)
+            _journal(
+                f"ZONE {symbol} | {option_type} {zone_eval['action']} | "
+                f"score_adj={zone_eval['score_adjustment']:+d} | {zone_eval['note']}"
+            )
+            if zone_eval["action"] == "REJECT":
+                msg = f"{option_type} rejected by zone logic | {symbol} | {zone_eval['note']}"
+                if force:
+                    logger.info(
+                        f"Soft gate bypassed due to 9/10 | {symbol} | zone "
+                        f"{zone_eval['note']} — proceeding (no zone boost applied)"
+                    )
+                    send_discord_message(
+                        f"⚙️ Soft gate bypassed due to 9/10 | {symbol} | zone REJECT "
+                        f"({zone_eval['note']})"
+                    )
+                else:
+                    logger.info(msg)
+                    send_discord_message(f"🚫 {msg}")
+                    blocked_zone += 1
+                    continue
+
+            # Apply the zone score boost to the confidence used for gating,
+            # capped so a boost can never exceed the configured ceiling.
+            zone_boost = int(zone_eval.get("score_adjustment", 0) or 0)
+            effective_confidence = min(
+                confidence + zone_boost, int(ZONE_LOGIC.get("max_confidence", 10))
+            )
+            if zone_boost:
                 logger.info(
-                    f"SKIP {symbol} | confidence {confidence}/10 < "
-                    f"threshold {effective_min_confidence} — logged, not executed"
+                    f"ZONE BOOST {symbol} | confidence {confidence} → "
+                    f"{effective_confidence} (+{zone_boost}) | {zone_eval['note']}"
                 )
-                _journal(
-                    f"SKIP (confidence {confidence}/10 < {effective_min_confidence}): "
-                    f"{symbol} | {trade_plan.get('decision')} | "
-                    f"thesis={str(trade_plan.get('thesis', ''))[:80]}"
-                )
-                skipped_confidence += 1
-                continue
+
+            # Gate 0d: earnings proximity (IV-crush avoidance). Block NEW entries
+            # within HARD_RULES['earnings_block_days'] of the next earnings date.
+            # Fail-open: an unknown earnings date does NOT block (only a
+            # positively-known, near date rejects).
+            earnings_block_days = int(HARD_RULES.get("earnings_block_days", 0) or 0)
+            if earnings_block_days > 0:
+                dte_earnings = get_days_to_earnings(symbol)
+                if dte_earnings is not None and dte_earnings <= earnings_block_days:
+                    msg = (
+                        f"{option_type} blocked near earnings | {symbol} | "
+                        f"{dte_earnings}d to earnings (<= {earnings_block_days}d)"
+                    )
+                    if force:
+                        # HARD safety: earnings block is configured as a hard rule.
+                        hmsg = (
+                            f"🛑 9/10 blocked by HARD SAFETY: earnings in {dte_earnings}d "
+                            f"(<= {earnings_block_days}d) | {symbol}"
+                        )
+                        logger.warning(hmsg)
+                        _journal(hmsg)
+                        send_discord_message(hmsg)
+                    else:
+                        logger.info(msg)
+                        _journal(f"EARNINGS BLOCK: {symbol} | {dte_earnings}d to earnings")
+                        send_discord_message(f"🚫 {msg}")
+                    blocked_earnings += 1
+                    continue
+
+            # Gate 1: confidence threshold (raised in NEUTRAL regimes, plus any
+            # zone score boost applied above)
+            if effective_confidence < effective_min_confidence:
+                if force:
+                    logger.info(
+                        f"Soft gate bypassed due to 9/10 | {symbol} | confidence "
+                        f"{effective_confidence}/10 < threshold {effective_min_confidence} "
+                        f"(neutral-regime bump) — proceeding"
+                    )
+                else:
+                    logger.info(
+                        f"SKIP {symbol} | confidence {effective_confidence}/10 < "
+                        f"threshold {effective_min_confidence} — logged, not executed"
+                    )
+                    _journal(
+                        f"SKIP (confidence {effective_confidence}/10 < {effective_min_confidence}): "
+                        f"{symbol} | {trade_plan.get('decision')} | "
+                        f"thesis={str(trade_plan.get('thesis', ''))[:80]}"
+                    )
+                    skipped_confidence += 1
+                    continue
 
             # Gate 2: DRY_RUN
             if dry_run:
@@ -410,6 +685,19 @@ def _run_normal_scan(dry_run: bool, research_live: bool = False) -> None:
             sector_size = float(sector_gate.get("size_multiplier", 1.0))
             effective_size_multiplier = round(regime_size * sector_size, 4)
 
+            # 9/10 size floor: a forced setup that passed a soft block (e.g. a
+            # BEARISH-regime call sized at 0.0) must still carry a real budget so
+            # the order attempt is meaningful. Floor the multiplier, never raise
+            # it above the normally-computed size.
+            if force:
+                floor = float(FORCE_EXECUTION.get("min_size_multiplier", 0.5))
+                if effective_size_multiplier < floor:
+                    logger.info(
+                        f"9/10 size floor | {symbol} | {effective_size_multiplier:.0%} → "
+                        f"{floor:.0%} (forced attempt needs a tradeable budget)"
+                    )
+                    effective_size_multiplier = floor
+
             if effective_size_multiplier != 1.0:
                 for _plan in (trade_plan, trade_plan.get("trade_plan", {})):
                     if isinstance(_plan, dict) and _plan.get("max_to_spend"):
@@ -421,9 +709,11 @@ def _run_normal_scan(dry_run: bool, research_live: bool = False) -> None:
                     f"sector {sector_gate['rank']} {sector_size:.0%})"
                 )
 
-            # Execute
+            # Execute. `force` flows into the executor so it relaxes its own SOFT
+            # filters (low/moderate volume, borderline R/R above the hard floor)
+            # while keeping every HARD safety control enforced.
             logger.info(f"Executing paper trade: {symbol} | confidence={confidence}/10")
-            result = place_options_trade(symbol, trade_plan, account)
+            result = place_options_trade(symbol, trade_plan, account, force=force)
             if result.get("success"):
                 msg = (
                     f"EXECUTED: {symbol} | order={result.get('order_id')} | "
@@ -431,11 +721,34 @@ def _run_normal_scan(dry_run: bool, research_live: bool = False) -> None:
                 )
                 logger.info(msg)
                 _journal(msg)
+                if force:
+                    omsg = (
+                        f"✅ 9/10 order submitted | {symbol} | "
+                        f"order={result.get('order_id')} | confidence={confidence}/10"
+                    )
+                    logger.info(omsg)
+                    send_discord_message(omsg)
                 executed += 1
             else:
-                msg = f"REJECTED: {symbol} | {result.get('reason')}"
+                reason = result.get("reason")
+                msg = f"REJECTED: {symbol} | {reason}"
                 logger.warning(msg)
                 _journal(msg)
+                if force:
+                    # Distinguish a contract/option-selection failure from a hard
+                    # account/risk safety block for clearer 9/10 telemetry.
+                    low = str(reason).lower()
+                    selection_keys = (
+                        "contract", "underlying", "liquidity", "quote",
+                        "spread", "option price", "too expensive",
+                    )
+                    if any(k in low for k in selection_keys):
+                        fmsg = f"🛑 9/10 option selection failed: {reason} | {symbol}"
+                    else:
+                        fmsg = f"🛑 9/10 blocked by HARD SAFETY: {reason} | {symbol}"
+                    logger.warning(fmsg)
+                    _journal(fmsg)
+                    send_discord_message(fmsg)
                 rejected += 1
 
         logger.info(
@@ -446,6 +759,8 @@ def _run_normal_scan(dry_run: bool, research_live: bool = False) -> None:
             f"below_confidence={skipped_confidence} | "
             f"regime_blocked={blocked_regime} | "
             f"sector_blocked={blocked_sector} | "
+            f"zone_blocked={blocked_zone} | "
+            f"earnings_blocked={blocked_earnings} | "
             f"rejected={rejected}"
         )
 
@@ -490,6 +805,68 @@ def _run_normal_scan(dry_run: bool, research_live: bool = False) -> None:
     except Exception as exc:
         logger.error(f"NORMAL SCAN failed: {exc}", exc_info=True)
         _journal(f"SCAN ERROR: {exc}")
+
+
+# ─────────────────────────────────────────────────────────────
+# DAILY ZONE-MARKING WATCHLIST — 20:00 ET (Sun-Thu) + 06:00 ET (Mon-Fri)
+# ─────────────────────────────────────────────────────────────
+
+def _run_watchlist_notification(slot_label: str = "") -> None:
+    """Screen the universe and post the daily zone-marking watchlist to Discord.
+
+    Runs the SAME selection stack the live scan uses — market regime, sector
+    strength and the AI A+ scan (run_full_scan) — but is NOTIFICATION ONLY: it
+    never places a trade, never creates a TradingView zone, and touches none of
+    the execution gates. It exists so the human gets the bot's top candidates
+    ahead of the open (8 PM the evening before and 6 AM ET) with time to draw
+    supply/demand zones manually in TradingView, which the bot then treats as
+    confirmation/context.
+    """
+    logger.info(f"DAILY WATCHLIST screen starting{(' | ' + slot_label) if slot_label else ''}")
+    try:
+        account = get_account_status()
+        macro = get_macro_data()
+
+        # Market regime → sector strength (same order as the live scan funnel).
+        regime = get_market_regime()
+        log_regime(regime)
+        sectors = get_sector_strength(
+            spy_return=regime.spy.get("return_21d"),
+            qqq_return=regime.qqq.get("return_21d"),
+        )
+        log_sector_strength(sectors)
+
+        # AI A+ screen / scoring. No execution path is invoked.
+        scan_result = run_full_scan(macro, account)
+        actionable = scan_result.get("actionable", [])
+        watch_candidates = scan_result.get("watch_candidates", [])
+
+        # Surface the strongest picks first (confidence desc), mirroring how the
+        # live scan prioritises before caps bind.
+        actionable.sort(
+            key=lambda s: int((s.get("trade_plan", {}) or {}).get("confidence", 0) or 0),
+            reverse=True,
+        )
+
+        entries = _build_watchlist_entries(actionable, watch_candidates, sectors, top_n=8)
+        if not entries:
+            logger.info("Daily watchlist: no candidates to post")
+            _journal(f"DAILY WATCHLIST{(' | ' + slot_label) if slot_label else ''} | no candidates")
+            return
+
+        notify_daily_watchlist(entries, regime=regime.regime, top_n=8)
+        logger.info(
+            f"Daily watchlist posted | {len(entries)} candidates | regime={regime.regime}"
+            f"{(' | ' + slot_label) if slot_label else ''}"
+        )
+        _journal(
+            "DAILY WATCHLIST | "
+            + (f"{slot_label} | " if slot_label else "")
+            + ", ".join(f"{e['symbol']}({e['bias']})" for e in entries)
+        )
+    except Exception as exc:
+        logger.error(f"Daily watchlist screen failed: {exc}", exc_info=True)
+        _journal(f"DAILY WATCHLIST ERROR: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -624,9 +1001,11 @@ def _run_watchlist_rebuild() -> None:
 def start(dry_run: bool) -> None:
     """Register all jobs and start the background scheduler."""
 
-    # Normal scans — every 30 min, 09:30–15:30 CT, Mon-Fri.
-    # Only the opening scan fetches live Perplexity research; the rest are
-    # cache-only, so the higher cadence does not increase Perplexity calls.
+    # Normal scans — every 30 min in EASTERN time across the scan window
+    # (08:30–16:00 ET by default: 1h before the open through the close), Mon-Fri.
+    # Pre-open slots screen only (see _run_normal_scan's pre-market guard). Only
+    # the first slot fetches live Perplexity research; the rest are cache-only,
+    # so the higher cadence does not increase Perplexity calls.
     for idx, (hour, minute) in enumerate(_normal_scan_times()):
         research_live = idx == 0
         scheduler.add_job(
@@ -635,11 +1014,35 @@ def start(dry_run: bool) -> None:
                 day_of_week="mon-fri",
                 hour=hour,
                 minute=minute,
-                timezone=CT_TIMEZONE,
+                timezone=ET_TIMEZONE,
             ),
             args=(dry_run, research_live),
-            id=f"normal_scan_{hour:02d}_{minute:02d}",
+            id=f"normal_scan_{hour:02d}_{minute:02d}_et",
         )
+
+    # Daily zone-marking watchlist alerts (Eastern time). Posted the evening
+    # before each trading day (Sun-Thu) and again pre-open (Mon-Fri) so zones can
+    # be drawn manually in TradingView before the market opens. Notification only.
+    eve_h, eve_m = WATCHLIST_ALERT_EVENING_ET
+    scheduler.add_job(
+        _run_watchlist_notification,
+        trigger=CronTrigger(
+            # Evenings before each trading day. Listed explicitly because
+            # APScheduler can't express the wrapping range "sun-thu".
+            day_of_week="sun,mon,tue,wed,thu", hour=eve_h, minute=eve_m, timezone=ET_TIMEZONE
+        ),
+        args=(f"{eve_h:02d}:{eve_m:02d} ET evening (next-day prep)",),
+        id="daily_watchlist_evening",
+    )
+    morn_h, morn_m = WATCHLIST_ALERT_MORNING_ET
+    scheduler.add_job(
+        _run_watchlist_notification,
+        trigger=CronTrigger(
+            day_of_week="mon-fri", hour=morn_h, minute=morn_m, timezone=ET_TIMEZONE
+        ),
+        args=(f"{morn_h:02d}:{morn_m:02d} ET pre-open",),
+        id="daily_watchlist_morning",
+    )
 
     # Pre-market macro + intelligence — 08:00 CT
     scheduler.add_job(

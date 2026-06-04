@@ -13,14 +13,17 @@ load_dotenv()
 # ─────────────────────────────────────────────────────────────
 ACCOUNT = {
     "total_capital":              10_000,    # Total account size
-    "max_per_trade_pct":          0.05,      # Max 5% per trade = $500 max (tightened risk control)
+    "max_per_trade_pct":          0.30,      # Max 30% per trade = $3,000 max deployed (1–2 contracts)
     "max_open_positions":         5,         # Never more than 5 concurrent positions
     "reserve_cash_pct":           0.30,      # Always keep 30% cash reserve = $3,000
     "paper_trading":              True,      # ALWAYS start in paper mode
     "kill_switch_enabled":        True,      # Enable daily loss and trade count protection
-    "max_daily_loss_usd":         500,       # Stop new trades after this much realized loss in a day
+    "max_daily_loss_usd":         1500,      # Stop new trades after this much realized loss in a day
+                                             # (~2 full -15% stops on max-size positions)
     "max_trades_per_day":         5,         # Stop new trades after this many fills in a day
-    "min_confidence_to_execute":  7,         # Minimum Claude confidence score (1-10) before placing a trade
+    "min_confidence_to_execute":  7,         # Minimum confidence score (1-10) before placing a trade.
+                                             # AI mode: Claude's confidence. Deterministic mode: the
+                                             # rule-based signal score (bull for CALLs, bear for PUTs).
 }
 
 # Override PAPER_TRADING from .env when explicitly set
@@ -46,6 +49,29 @@ RISK_REWARD = {
 }
 
 # ─────────────────────────────────────────────────────────────
+# 9/10 FORCE EXECUTION ATTEMPT RULE
+# When a setup is graded at or above `min_confidence`, the bot MUST attempt to
+# place a paper trade rather than routing it to WATCH mode. SOFT filters may
+# REDUCE size but never block the attempt:
+#   - neutral market regime / directional regime gating
+#   - moderate (or low) volume
+#   - sector not strongest
+#   - missing / misaligned TradingView supply-demand zone
+#   - AI unavailable (deterministic fallback)
+#   - borderline risk/reward, as long as it is above RISK_REWARD['hard_floor']
+# HARD safety controls are ALWAYS enforced, even for a 9/10 (see validate_trade
+# and place_options_trade): paper-only, kill switch, max daily loss, max trades
+# per day, max open positions, buying power, reserve cash, position-size cap,
+# valid option contract on the correct underlying, valid bid/ask, spread within
+# the hard max, earnings block, and any Alpaca order rejection.
+# ─────────────────────────────────────────────────────────────
+FORCE_EXECUTION = {
+    "enabled":              True,   # Master switch for the 9/10 force-attempt rule
+    "min_confidence":       9,      # confidence >= this forces a paper-trade ATTEMPT
+    "min_size_multiplier":  0.5,    # forced trades through a soft block size at >= this
+}
+
+# ─────────────────────────────────────────────────────────────
 # PUT / BEARISH SETUP SUPPORT (Phase 3B)
 # Controls when the bot is allowed to take the SHORT side via PUTs.
 # All existing CALL/LONG logic and safety controls are unaffected.
@@ -65,11 +91,12 @@ PUT_SUPPORT = {
 # GEORGE'S HARD RULES (NEVER VIOLATE — SYSTEM WILL REJECT)
 # ─────────────────────────────────────────────────────────────
 HARD_RULES = {
-    "max_otm_pct":          0.15,      # Never more than 15% OTM strike
+    "max_otm_pct":          0.07,      # Never more than 7% OTM strike (higher-delta, higher win-prob)
+    "max_strike_pct_otm":   0.05,      # Strike selector caps OTM distance here (closer to ATM)
     "rsi_overbought":       70,        # Reject any long if RSI >= 70
     "rsi_oversold":         30,        # Alert level for oversold
     "rsi_ideal_min":        40,        # Ideal RSI entry range minimum
-    "rsi_ideal_max":        65,        # Ideal RSI entry range maximum
+    "rsi_ideal_max":        58,        # Ideal RSI entry ceiling — buy pullbacks, not extension
     "adx_trend_min":        20,        # ADX must be above 20 for trend
     "adx_strong":           25,        # ADX above 25 = strong trend
     "min_volume_ratio":     1.10,      # Volume must be at least 110% of 50-day average
@@ -78,11 +105,14 @@ HARD_RULES = {
     "no_trade_open_mins":   30,        # No trades first 30 min after open
     "require_macro_green":  False,      # If True, only allow new longs when macro is GREEN
     "min_hold_days":        0,         # Minimum holding period after entry
-    "max_contracts":        1,         # Never more than 1 contract per position
+    "max_contracts":        0,         # 0 = unlimited; the per-trade dollar budget governs quantity
+    "max_option_loss_pct":  0.15,      # Hard stop: exit if premium falls 15% from entry (max loss/trade)
     "min_earnings_beats":   4,         # Minimum 4 consecutive beats for A+
+    "earnings_block_days":  7,         # Block NEW entries within this many days of earnings (IV-crush risk)
     "min_drawdown_pct":     0.20,      # Prefer stocks down 20%+ from 52wk high
-    "target_1_gain":        0.50,      # First profit target: 50% option gain
-    "target_2_gain":        1.00,      # Second target: 100% option gain
+    "target_1_gain":        0.30,      # First profit target: scale half at +30% (win-rate lever)
+    "target_2_gain":        1.00,      # Second (runner) target: 100% option gain
+    "breakeven_trigger_gain": 0.20,    # Once a position is +20%, lift the stop to breakeven
     "options_expiry_days":  75,        # Target ~75-90 days to expiry
     "leap_expiry_days":     365,       # LEAP target ~12 months
 }
@@ -110,8 +140,16 @@ SIGNAL_WEIGHTS = {
     "macro_green":          1,         # Macro environment favorable
 
     # A+ threshold
-    "min_score_aplus":      8,         # Score >= 8 = A+ LONG signal
+    "min_score_aplus":      8,         # Score >= 8 = A+ LONG signal (quality label)
     "min_score_long":       5,         # Score >= 5 = LONG signal
+    # Execution threshold for LONG/CALL setups. A setup is eligible to be sent to
+    # the AI + executor when bull_score >= this AND it still clears the SAME
+    # quality gates as an A+ LONG (BULL bias, RSI <= rsi_ideal_max, ADX >=
+    # adx_trend_min). Lowering this from 8 to 7 lets strong-but-not-A+ setups
+    # trade; every downstream control (AI confidence >= min_confidence_to_execute,
+    # volume tier, risk/reward floors, regime, sector, zone, liquidity, sizing,
+    # kill switch) is unchanged. Set back to 8 to restrict execution to A+ only.
+    "min_score_to_trade_long": 7,
 
     # BEAR conditions
     "bias_bear":            2,
@@ -205,7 +243,7 @@ SECTOR_STRENGTH = {
     "weak_rel_threshold":     2.0,    # sector trails the blend by >= 2% → WEAK
     # How to treat a setup that trades AGAINST sector strength
     # (a CALL in a WEAK sector, or a PUT in a STRONG sector):
-    "contra_action":          "REDUCE",  # "REDUCE" (size down) or "REJECT" (block)
+    "contra_action":          "REJECT",  # "REDUCE" (size down) or "REJECT" (block). REJECT = no counter-trend.
     "contra_size_multiplier": 0.5,        # size factor when contra_action == "REDUCE"
 }
 
@@ -235,6 +273,57 @@ OPTIONS_LIQUIDITY = {
     # entitlement on the paper account), reject by default (fail-closed). Set to
     # True to let trades through when liquidity data cannot be retrieved.
     "fail_open_on_error":   False,
+}
+
+# ─────────────────────────────────────────────────────────────
+# TRADINGVIEW SUPPLY/DEMAND WEBHOOK RECEIVER (Phase 4A)
+# Inbound HTTP endpoint that ingests TradingView alert webhooks carrying
+# supply/demand zones. Phase 4A is the RECEIVER only: it authenticates,
+# validates, persists, logs, and posts to Discord. Zones are exposed for a
+# later phase to consume — they are NOT yet wired into scan/execution.
+#
+# Security: the shared secret is read from the env var TRADINGVIEW_WEBHOOK_SECRET
+# (never stored in config). If it is unset, the server refuses to start so an
+# unauthenticated endpoint is never exposed.
+# ─────────────────────────────────────────────────────────────
+TRADINGVIEW = {
+    "enabled":         True,
+    "host":            "0.0.0.0",                 # bind address (put behind a firewall/proxy)
+    "port":            8000,                       # overridable via TRADINGVIEW_WEBHOOK_PORT
+    "path":            "/webhook/tradingview",     # POST alerts here; GET = health check
+    "zone_ttl_hours":  72,                         # a zone expires after this unless refreshed
+    "max_body_bytes":  16384,                      # reject oversized request bodies
+}
+
+# ─────────────────────────────────────────────────────────────
+# ZONE-AWARE EXECUTION LOGIC (Phase 4B)
+# Consumes the supply/demand zones stored by the Phase 4A TradingView receiver
+# (db.supply_demand_zones) and turns them into a directional gate + confidence
+# nudge in the scheduler, alongside the regime / sector / liquidity gates.
+#
+#   CALL → prefer DEMAND zones; reject if too close to a SUPPLY zone; boost the
+#          score when price is near a DEMAND zone.
+#   PUT  → prefer SUPPLY zones; reject if too close to a DEMAND zone; boost the
+#          score when price is near a SUPPLY zone.
+#
+# Distances are FRACTIONS of the current price (0.03 = 3%). A zone counts as
+# "near" when price is at-or-inside the band (distance 0.0) up to the threshold.
+# All existing protections (paper trading, regime/sector/liquidity gates, volume
+# sizing, risk management, kill switch, Discord alerts) are preserved unchanged.
+# ─────────────────────────────────────────────────────────────
+ZONE_LOGIC = {
+    "enabled":                          True,
+    "MAX_DISTANCE_TO_ZONE":             0.03,   # price within 3% of a favouring zone → score boost
+    "REJECT_DISTANCE_TO_OPPOSITE_ZONE": 0.015,  # price within 1.5% of the opposite zone → reject
+    "ZONE_SCORE_BOOST":                 1,      # confidence points added when aligned + near zone
+    "max_zone_age_hours":               48,     # ignore zones older than this (stale), independent of TTL
+    "max_confidence":                   10,     # cap confidence after the boost
+    # When True, if a symbol HAS active zones the entry MUST be at/near a
+    # favouring zone (demand for CALL, supply for PUT) or it is rejected — i.e.
+    # the manually-drawn zones become entry triggers, not just a nudge. Symbols
+    # with NO active zones are unaffected (they fall back to ALLOW), so this
+    # never halts names you haven't marked up.
+    "require_zone_for_entry":           True,
 }
 
 # NORMAL MODE: Low resource scan schedule (3 scans per trading day in CT)
@@ -285,7 +374,29 @@ SCHEDULE = {
     "watchlist_rebuild":    "SUN 20:00",  # Sunday night watchlist update
 }
 
-CT_TIMEZONE = "America/Chicago"   # All cron schedules use this timezone
+CT_TIMEZONE = "America/Chicago"   # Legacy jobs (pre-market, after-hours, weekly) use this
+ET_TIMEZONE = "America/New_York"  # Market-relative jobs (scans + watchlist alerts) use Eastern
+
+# Regular US equity session in Eastern time. Scans run every 30 min starting
+# SCAN_PREOPEN_LEAD_MIN before the open (for pre-market screening / zone prep)
+# through the close; pre-open scans screen only and never place trades.
+MARKET_OPEN_ET = (9, 30)
+MARKET_CLOSE_ET = (16, 0)
+SCAN_PREOPEN_LEAD_MIN = 60   # begin scanning this many minutes before the open
+SCAN_INTERVAL_MIN = 30       # baseline cadence during the window
+
+# Opening "power hour": for the first SCAN_OPEN_POWER_DURATION_MIN after the
+# open, scan more frequently (every SCAN_OPEN_POWER_INTERVAL_MIN) to actively
+# hunt the morning's best entries while the move is fresh. These slots are
+# inside RTH, so they look for trades (not screening-only).
+SCAN_OPEN_POWER_INTERVAL_MIN = 5    # cadence during the opening power hour
+SCAN_OPEN_POWER_DURATION_MIN = 60   # length of the faster window after the open
+
+# Daily zone-marking watchlist alerts (Eastern time). Sent the evening before a
+# trading day and again pre-open, so supply/demand zones can be drawn manually
+# in TradingView before the market opens.
+WATCHLIST_ALERT_EVENING_ET = (20, 0)   # 8:00 PM ET, evenings before trading days (Sun–Thu)
+WATCHLIST_ALERT_MORNING_ET = (6, 0)    # 6:00 AM ET, trading mornings (Mon–Fri)
 
 # ─────────────────────────────────────────────────────────────
 # LOGGING
