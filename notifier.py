@@ -80,6 +80,17 @@ def send_discord_message(message: str) -> bool:
     return _send_discord({"content": _clean_string(message)})
 
 
+def notify_portfolio_report(title: str, body: str, color: int = COLOR_BLUE) -> bool:
+    """Send a scheduled portfolio P/L report as a Discord embed.
+
+    The full report text goes in the embed description (Discord allows up to
+    4096 chars there, far more than a plain message's 2000), so multi-position
+    reports render cleanly. Footer marks it paper-trading-only.
+    """
+    embed = _build_embed(title, description=str(body)[:4000], color=color)
+    return _send_discord({"embeds": [embed]})
+
+
 def notify_watch_mode(
     symbol: str,
     direction: str,
@@ -317,6 +328,44 @@ def notify_runner_closed(
     return _send_discord({"embeds": [embed]})
 
 
+def notify_supply_demand_zone(
+    symbol: str,
+    zone_type: str,
+    price_low: float,
+    price_high: float,
+    timeframe: str = None,
+    source: str = "TradingView",
+    note: str = None,
+) -> bool:
+    """Post a received TradingView supply/demand zone to Discord.
+
+    DEMAND zones (support / buyers) are green; SUPPLY zones (resistance /
+    sellers) are red.
+    """
+    zone_type = (zone_type or "").upper()
+    color = COLOR_GREEN if zone_type == "DEMAND" else COLOR_RED
+    if price_low == price_high:
+        price_txt = f"${price_low:.2f}"
+    else:
+        price_txt = f"${price_low:.2f} – ${price_high:.2f}"
+    fields = [
+        {"name": "Ticker", "value": symbol, "inline": True},
+        {"name": "Zone Type", "value": zone_type or "N/A", "inline": True},
+        {"name": "Timeframe", "value": timeframe or "N/A", "inline": True},
+        {"name": "Price Zone", "value": price_txt, "inline": False},
+        {"name": "Source", "value": source or "TradingView", "inline": True},
+    ]
+    if note:
+        fields.append({"name": "Note", "value": note, "inline": False})
+    embed = _build_embed(
+        f"Supply/Demand Zone — {symbol}",
+        description="Zone received from TradingView (stored for analysis; not yet wired into execution).",
+        fields=fields,
+        color=color,
+    )
+    return _send_discord({"embeds": [embed]})
+
+
 def notify_liquidity_blocked(
     symbol: str,
     option_type: str,
@@ -441,5 +490,59 @@ def notify_sector_strength(
         description="Sector/theme strength vs SPY/QQQ, assessed before ranking stocks.",
         fields=fields,
         color=COLOR_BLUE,
+    )
+    return _send_discord({"embeds": [embed]})
+
+
+def notify_daily_watchlist(
+    entries: list[dict],
+    regime: str = "NEUTRAL",
+    top_n: int = 8,
+) -> bool:
+    """Post the daily screened watchlist so zones can be marked manually.
+
+    `entries` is the bot's own top screened candidates (already ranked). Each
+    entry dict carries:
+        symbol, bias (CALL/PUT/NEUTRAL), zone_label (mark DEMAND/SUPPLY/BOTH),
+        sector, sector_rank, confidence_display, reason
+
+    This is a heads-up for the human to add supply/demand zones in TradingView.
+    It does NOT create zones, does NOT execute anything, and the zones the user
+    later marks are treated as confirmation/context only by the bot.
+    """
+    entries = [e for e in (entries or []) if e.get("symbol")][:top_n]
+    if not entries:
+        return False
+
+    regime = (regime or "NEUTRAL").upper()
+    color = {
+        "BULLISH": COLOR_GREEN,
+        "NEUTRAL": COLOR_GREY,
+        "BEARISH": COLOR_RED,
+    }.get(regime, COLOR_BLUE)
+
+    fields = []
+    for e in entries:
+        bias = str(e.get("bias", "NEUTRAL")).upper()
+        value = (
+            f"Bias: {bias}\n"
+            f"Zones to mark: {e.get('zone_label', 'mark BOTH')}\n"
+            f"Sector: {e.get('sector', 'UNCLASSIFIED')} ({e.get('sector_rank', 'NEUTRAL')})\n"
+            f"Confidence: {e.get('confidence_display', 'n/a')}\n"
+            f"Reason: {str(e.get('reason') or 'Selected by screen')[:180]}"
+        )
+        fields.append({"name": f"{e['symbol']} — {bias}", "value": value, "inline": False})
+
+    description = (
+        f"Market regime: **{regime}**. Top {len(entries)} screened candidate(s) to monitor.\n"
+        "Manually add the listed supply/demand zones in TradingView. "
+        "TradingView levels are confirmation/context only — the bot does not "
+        "auto-create zones and never executes from a TradingView alert alone."
+    )
+    embed = _build_embed(
+        f"DAILY WATCHLIST — {regime}",
+        description=description,
+        fields=fields,
+        color=color,
     )
     return _send_discord({"embeds": [embed]})

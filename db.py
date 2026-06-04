@@ -204,6 +204,29 @@ def initialize_database():
         expires_at      TEXT NOT NULL
     )""")
 
+    # ── SUPPLY / DEMAND ZONES (Phase 4A — TradingView webhook) ──
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS supply_demand_zones (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol          TEXT NOT NULL,
+        zone_type       TEXT NOT NULL,        -- SUPPLY | DEMAND
+        direction_bias  TEXT,                 -- BULLISH | BEARISH | N/A (from TradingView alert)
+        price_low       REAL NOT NULL,
+        price_high      REAL NOT NULL,
+        timeframe       TEXT,
+        source          TEXT,                 -- e.g. TRADINGVIEW
+        note            TEXT,
+        raw             TEXT,                 -- original payload JSON
+        created_at      TEXT NOT NULL,
+        expires_at      TEXT NOT NULL
+    )""")
+
+    # Migration: add direction_bias to supply_demand_zones tables created before
+    # the column existed (CREATE TABLE IF NOT EXISTS won't alter an old table).
+    cursor.execute("PRAGMA table_info(supply_demand_zones)")
+    if "direction_bias" not in {row[1] for row in cursor.fetchall()}:
+        cursor.execute("ALTER TABLE supply_demand_zones ADD COLUMN direction_bias TEXT")
+
     conn.commit()
     conn.close()
     logger.info("✅ Database initialized successfully")
@@ -231,6 +254,25 @@ def log_trade_entry(trade_data: dict) -> int:
     conn.close()
     logger.info(f"📝 Trade logged: {trade_data.get('symbol')} | ID: {trade_id}")
     return trade_id
+
+
+def update_trade_fields(trade_id: int, fields: dict):
+    """Update arbitrary columns on an OPEN trade (e.g. trailing the stop).
+
+    Unlike update_trade_exit this does not compute P/L or set an exit date — it
+    is for in-flight adjustments to a still-open position.
+    """
+    if not fields:
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    set_clause = ', '.join([f"{k} = ?" for k in fields.keys()])
+    cursor.execute(
+        f"UPDATE trades SET {set_clause} WHERE id = ?",
+        list(fields.values()) + [trade_id],
+    )
+    conn.commit()
+    conn.close()
 
 
 def update_trade_exit(trade_id: int, exit_data: dict):
@@ -398,6 +440,18 @@ def get_today_realized_pnl() -> float:
     cursor.execute(
         "SELECT SUM(pnl_dollars) as total FROM trades WHERE DATE(exit_date) = ? AND status != 'OPEN'",
         (today,)
+    )
+    result = cursor.fetchone()
+    conn.close()
+    return float(result[0] or 0.0)
+
+
+def get_total_realized_pnl() -> float:
+    """Return all-time realized P/L from every closed trade."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT SUM(pnl_dollars) as total FROM trades WHERE status != 'OPEN'"
     )
     result = cursor.fetchone()
     conn.close()
@@ -573,6 +627,85 @@ def delete_expired_research_cache():
     cursor.execute("DELETE FROM research_cache WHERE expires_at <= ?", (datetime.now().isoformat(),))
     conn.commit()
     conn.close()
+
+
+# ─────────────────────────────────────────────────────────────
+# SUPPLY / DEMAND ZONES (Phase 4A — TradingView webhook receiver)
+# ─────────────────────────────────────────────────────────────
+
+def save_supply_demand_zone(zone: dict, ttl_hours: int = 72) -> int:
+    """Persist a supply/demand zone from a TradingView alert. Returns row ID.
+
+    Expected keys: symbol, zone_type (SUPPLY|DEMAND), direction_bias, price_low,
+    price_high, timeframe, source, note, raw.
+    """
+    created_at = datetime.now().isoformat()
+    expires_at = (datetime.now() + timedelta(hours=ttl_hours)).isoformat()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """INSERT INTO supply_demand_zones
+           (symbol, zone_type, direction_bias, price_low, price_high, timeframe, source, note, raw, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            zone.get("symbol"),
+            zone.get("zone_type"),
+            zone.get("direction_bias"),
+            zone.get("price_low"),
+            zone.get("price_high"),
+            zone.get("timeframe"),
+            zone.get("source", "TRADINGVIEW"),
+            zone.get("note"),
+            zone.get("raw"),
+            created_at,
+            expires_at,
+        ),
+    )
+    zone_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    logger.info(
+        f"📥 Supply/demand zone saved: {zone.get('symbol')} {zone.get('zone_type')} "
+        f"{zone.get('price_low')}–{zone.get('price_high')} (expires {expires_at})"
+    )
+    return zone_id
+
+
+def get_active_zones(symbol: str = None) -> list:
+    """Return non-expired supply/demand zones, optionally filtered by symbol.
+
+    Most recently received first. Exposed for a later phase to consume; the
+    Phase 4A receiver only writes zones.
+    """
+    now = datetime.now().isoformat()
+    conn = get_connection()
+    cursor = conn.cursor()
+    if symbol:
+        cursor.execute(
+            "SELECT * FROM supply_demand_zones WHERE expires_at > ? AND symbol = ? ORDER BY created_at DESC",
+            (now, symbol.upper()),
+        )
+    else:
+        cursor.execute(
+            "SELECT * FROM supply_demand_zones WHERE expires_at > ? ORDER BY created_at DESC",
+            (now,),
+        )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def delete_expired_zones() -> int:
+    """Delete expired supply/demand zones. Returns the number removed."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM supply_demand_zones WHERE expires_at <= ?", (datetime.now().isoformat(),)
+    )
+    removed = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return removed
 
 
 def add_to_watchlist(symbol: str, source: str, sector: str, reason: str, headline: str = None):

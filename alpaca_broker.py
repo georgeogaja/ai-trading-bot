@@ -77,6 +77,8 @@ def get_account_status() -> dict:
             "cash": float(account.cash),
             "portfolio_value": float(account.portfolio_value),
             "equity": float(getattr(account, "equity", account.portfolio_value)),
+            # Prior-session close equity — used to compute intraday day P/L.
+            "last_equity": float(getattr(account, "last_equity", None) or account.equity),
             "buying_power": float(account.buying_power),
             # Long options are paid from cash, so Alpaca's OPTIONS buying power
             # (≈ cash / non-marginable BP) is the real affordability limit — the

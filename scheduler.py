@@ -22,7 +22,7 @@ from loguru import logger
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from alpaca_broker import is_kill_switch_engaged
+from alpaca_broker import is_kill_switch_engaged, get_positions
 from config import (
     ACCOUNT,
     HARD_RULES,
@@ -38,8 +38,15 @@ from config import (
     WATCHLIST_ALERT_MORNING_ET,
     PUT_SUPPORT,
     FORCE_EXECUTION,
+    MAX_LOSS,
 )
-from db import get_mistake_patterns
+from db import (
+    get_mistake_patterns,
+    get_open_trades,
+    get_today_trade_count,
+    get_today_realized_pnl,
+    get_total_realized_pnl,
+)
 from market_intelligence import get_macro_data, run_market_intelligence
 from market_regime import BEARISH, BULLISH, NEUTRAL, get_market_regime, log_regime
 from sector_strength import get_sector_strength, log_sector_strength
@@ -51,6 +58,7 @@ from notifier import (
     notify_market_regime,
     notify_sector_strength,
     notify_watch_mode,
+    notify_portfolio_report,
     send_discord_message,
 )
 from state_manager import state_manager
@@ -998,6 +1006,109 @@ def _run_watchlist_rebuild() -> None:
 # SCHEDULER CONTROL
 # ─────────────────────────────────────────────────────────────
 
+def _run_portfolio_report(slot_label: str, sent_log: str) -> None:
+    """Scheduled portfolio P/L report → Discord (read-only).
+
+    Gathers account balances, open positions, per-position P/L + exit plan, and
+    next-trade capacity, then posts a Discord embed. Touches NO execution, watch
+    state, or webhook logic. `sent_log` is the exact confirmation line to log.
+    """
+    try:
+        account = get_account_status()
+        if account.get("error"):
+            logger.warning(f"Portfolio report skipped — account error: {account['error']}")
+            return
+
+        equity = float(account.get("equity") or account.get("portfolio_value") or 0)
+        last_equity = float(account.get("last_equity") or equity)
+        cash = float(account.get("cash") or 0)
+        options_bp = float(account.get("options_buying_power") or account.get("buying_power") or 0)
+        day_pl = round(equity - last_equity, 2)
+        realized_today = round(get_today_realized_pnl(), 2)
+        realized_total = round(get_total_realized_pnl(), 2)
+
+        positions = {p["symbol"]: p for p in get_positions()}
+        trades = get_open_trades()
+        n_pos = len(trades)
+
+        unrealized_total = 0.0
+        lines = []
+        for t in trades:
+            p = positions.get(t.get("option_symbol"), {})
+            opt_type = str(t.get("trade_type") or "CALL").upper()
+            qty = int(t.get("contracts") or 0)
+            entry = float(t.get("entry_option_price") or 0)
+            cur = float(p.get("current_price") or 0)
+            upl = float(p.get("unrealized_pl") or 0)
+            unrealized_total += upl
+            gain = (cur - entry) / entry if entry else 0.0
+            stop_prem = round(entry * (1 - HARD_RULES["max_option_loss_pct"]), 2)
+            t1 = float(t.get("target_1") or 0)
+            t2 = float(t.get("target_2") or 0)
+
+            # Hold / scale-out / exit decision under the current exit rules.
+            if t2 and cur >= t2:
+                plan = "EXIT runner (+100% target hit)"
+            elif t1 and cur >= t1:
+                plan = "SCALE OUT half (+30% target hit)"
+            elif stop_prem and cur <= stop_prem:
+                plan = "EXIT (stop hit)"
+            elif gain >= HARD_RULES["breakeven_trigger_gain"]:
+                plan = "HOLD (breakeven stop armed)"
+            else:
+                plan = "HOLD"
+
+            lines.append(
+                f"**{t.get('symbol')} {opt_type}** ×{qty} | strike ${t.get('strike')} exp {t.get('expiry')}\n"
+                f"  entry ${entry:.2f} → now ${cur:.2f} | P/L ${upl:+,.2f} ({gain:+.1%})\n"
+                f"  stop ${stop_prem:.2f} | target ${t1:.2f} (+30%) / ${t2:.2f} (+100%) | plan: {plan}"
+            )
+        unrealized_total = round(unrealized_total, 2)
+
+        # Next-trade capacity analysis.
+        max_risk_next = round(min(MAX_LOSS["max_loss_pct_of_equity"] * equity, options_bp), 2)
+        kill_on, kill_reason = is_kill_switch_engaged()
+        trades_today = get_today_trade_count()
+        pos_room = n_pos < ACCOUNT["max_open_positions"]
+        trade_room = trades_today < ACCOUNT["max_trades_per_day"]
+        can_trade = (not kill_on) and pos_room and trade_room and max_risk_next > 0
+        blocks = []
+        if kill_on:
+            blocks.append(f"kill switch ({kill_reason})")
+        if not pos_room:
+            blocks.append(f"max positions {n_pos}/{ACCOUNT['max_open_positions']}")
+        if not trade_room:
+            blocks.append(f"max trades/day {trades_today}/{ACCOUNT['max_trades_per_day']}")
+        if max_risk_next <= 0:
+            blocks.append("no risk budget")
+        can_trade_txt = "YES" if can_trade else f"NO — {', '.join(blocks)}"
+
+        body = (
+            f"**Account**\n"
+            f"Equity ${equity:,.2f} | Cash ${cash:,.2f} | Options BP ${options_bp:,.2f}\n"
+            f"Day P/L ${day_pl:+,.2f} | Unrealized ${unrealized_total:+,.2f} | "
+            f"Realized today ${realized_today:+,.2f} (all-time ${realized_total:+,.2f})\n\n"
+            f"**Open positions: {n_pos}/{ACCOUNT['max_open_positions']}**\n"
+            + ("\n".join(lines) if lines else "_None_")
+            + "\n\n**Next trade**\n"
+            f"Remaining options buying power ${options_bp:,.2f}\n"
+            f"Max allowed risk (20% equity, capped by BP): ${max_risk_next:,.2f} "
+            f"→ max premium ${max_risk_next / 100:,.2f}/share (1 contract)\n"
+            f"Can take another 9/10 today: {can_trade_txt}"
+        )
+
+        title = f"📊 {slot_label} Portfolio Report"
+        color = 0x2ECC71 if (day_pl + unrealized_total) >= 0 else 0xE74C3C
+        notify_portfolio_report(title, body, color=color)
+        logger.info(sent_log)
+        _journal(
+            f"{slot_label.upper()} PORTFOLIO REPORT | equity=${equity:,.2f} "
+            f"day_pl=${day_pl:+,.2f} unrealized=${unrealized_total:+,.2f} positions={n_pos}"
+        )
+    except Exception as exc:
+        logger.error(f"Portfolio report failed: {exc}", exc_info=True)
+
+
 def start(dry_run: bool) -> None:
     """Register all jobs and start the background scheduler."""
 
@@ -1084,6 +1195,28 @@ def start(dry_run: bool) -> None:
             day_of_week="sun", hour=20, minute=0, timezone=CT_TIMEZONE
         ),
         id="watchlist_rebuild",
+    )
+
+    # Portfolio P/L reports — 1 hour BEFORE the open and 1 hour AFTER the close,
+    # in Eastern market time, Mon-Fri. Derived from MARKET_OPEN_ET/CLOSE_ET so
+    # they track the configured session (08:30 ET pre, 17:00 ET post by default).
+    _pre_dt = datetime(2000, 1, 1, *MARKET_OPEN_ET) - timedelta(hours=1)
+    _post_dt = datetime(2000, 1, 1, *MARKET_CLOSE_ET) + timedelta(hours=1)
+    scheduler.add_job(
+        _run_portfolio_report,
+        trigger=CronTrigger(
+            day_of_week="mon-fri", hour=_pre_dt.hour, minute=_pre_dt.minute, timezone=ET_TIMEZONE
+        ),
+        args=("Pre-Market", "Pre-market portfolio report sent"),
+        id="portfolio_report_premarket",
+    )
+    scheduler.add_job(
+        _run_portfolio_report,
+        trigger=CronTrigger(
+            day_of_week="mon-fri", hour=_post_dt.hour, minute=_post_dt.minute, timezone=ET_TIMEZONE
+        ),
+        args=("Post-Market", "Post-market portfolio report sent"),
+        id="portfolio_report_postmarket",
     )
 
     mode = "DRY_RUN (log only)" if dry_run else "EXECUTE (paper trades active)"
