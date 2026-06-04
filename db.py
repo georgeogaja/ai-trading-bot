@@ -458,6 +458,31 @@ def get_total_realized_pnl() -> float:
     return float(result[0] or 0.0)
 
 
+def get_trades_entered_today() -> list:
+    """Return all trades opened today (any status)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    today = datetime.now().date().isoformat()
+    cursor.execute("SELECT * FROM trades WHERE DATE(entry_date) = ?", (today,))
+    trades = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return trades
+
+
+def get_trades_exited_today() -> list:
+    """Return all trades closed today (status != OPEN)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    today = datetime.now().date().isoformat()
+    cursor.execute(
+        "SELECT * FROM trades WHERE DATE(exit_date) = ? AND status != 'OPEN'",
+        (today,),
+    )
+    trades = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return trades
+
+
 # ─────────────────────────────────────────────────────────────
 # MISTAKE TRACKING
 # ─────────────────────────────────────────────────────────────

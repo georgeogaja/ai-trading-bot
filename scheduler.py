@@ -14,6 +14,7 @@ Schedules all recurring tasks:
 
 DRY_RUN is respected throughout: scans always run, trade placement is skipped.
 """
+import re
 from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -46,6 +47,8 @@ from db import (
     get_today_trade_count,
     get_today_realized_pnl,
     get_total_realized_pnl,
+    get_trades_entered_today,
+    get_trades_exited_today,
 )
 from market_intelligence import get_macro_data, run_market_intelligence
 from market_regime import BEARISH, BULLISH, NEUTRAL, get_market_regime, log_regime
@@ -1006,6 +1009,45 @@ def _run_watchlist_rebuild() -> None:
 # SCHEDULER CONTROL
 # ─────────────────────────────────────────────────────────────
 
+def _capital_exposure(equity: float, cash: float, options_bp: float, deployed: float,
+                      n_pos: int, max_open: int, intended_trade_size: float) -> tuple:
+    """Capital-allocation / exposure-control dashboard. Pure function.
+
+    Returns (dashboard_text, warnings_list). For long options, the capital
+    deployed equals the positions' current market value, and the max loss if
+    every option expired worthless is that same market value (a long option can
+    lose 100% of its current value).
+    """
+    pct_deployed = (deployed / equity) if equity else 0.0
+    max_loss_to_zero = deployed
+    pct_at_risk = (max_loss_to_zero / equity) if equity else 0.0
+    remaining = max(0, max_open - n_pos)
+
+    warnings = []
+    if pct_at_risk > 0.60:
+        warnings.append(
+            f"🔴 High exposure warning: open option risk ${max_loss_to_zero:,.2f} is "
+            f"{pct_at_risk:.0%} of equity (> 60%)"
+        )
+    if options_bp < intended_trade_size:
+        warnings.append(
+            f"🟠 Low buying power warning: options BP ${options_bp:,.2f} is below the next "
+            f"allowed trade size ${intended_trade_size:,.2f}"
+        )
+    if remaining <= 0:
+        warnings.append(f"🟡 Max positions warning: position slots full ({n_pos}/{max_open})")
+
+    dashboard = (
+        f"**Capital Allocation & Exposure**\n"
+        f"Equity ${equity:,.2f} | Cash ${cash:,.2f} | Options BP ${options_bp:,.2f}\n"
+        f"Deployed capital ${deployed:,.2f} ({pct_deployed:.0%} of account)\n"
+        f"Max loss if all options → $0: ${max_loss_to_zero:,.2f} "
+        f"({pct_at_risk:.0%} of account at risk)\n"
+        f"Positions {n_pos}/{max_open} | remaining slots {remaining}"
+    )
+    return dashboard, warnings
+
+
 def _run_portfolio_report(slot_label: str, sent_log: str) -> None:
     """Scheduled portfolio P/L report → Discord (read-only).
 
@@ -1032,6 +1074,7 @@ def _run_portfolio_report(slot_label: str, sent_log: str) -> None:
         n_pos = len(trades)
 
         unrealized_total = 0.0
+        deployed_mv = 0.0
         lines = []
         for t in trades:
             p = positions.get(t.get("option_symbol"), {})
@@ -1041,6 +1084,7 @@ def _run_portfolio_report(slot_label: str, sent_log: str) -> None:
             cur = float(p.get("current_price") or 0)
             upl = float(p.get("unrealized_pl") or 0)
             unrealized_total += upl
+            deployed_mv += float(p.get("market_value") or 0)
             gain = (cur - entry) / entry if entry else 0.0
             stop_prem = round(entry * (1 - HARD_RULES["max_option_loss_pct"]), 2)
             t1 = float(t.get("target_1") or 0)
@@ -1083,18 +1127,29 @@ def _run_portfolio_report(slot_label: str, sent_log: str) -> None:
             blocks.append("no risk budget")
         can_trade_txt = "YES" if can_trade else f"NO — {', '.join(blocks)}"
 
+        # Capital allocation / exposure dashboard + warnings. "Next allowed trade
+        # size" is the intended 20%-of-equity max-loss budget (before the BP cap).
+        intended_trade_size = round(MAX_LOSS["max_loss_pct_of_equity"] * equity, 2)
+        dashboard, warnings = _capital_exposure(
+            equity, cash, options_bp, round(deployed_mv, 2), n_pos,
+            ACCOUNT["max_open_positions"], intended_trade_size,
+        )
+        warn_block = ("**⚠️ Warnings**\n" + "\n".join(warnings) + "\n\n") if warnings else ""
+
         body = (
-            f"**Account**\n"
+            warn_block
+            + f"**Account**\n"
             f"Equity ${equity:,.2f} | Cash ${cash:,.2f} | Options BP ${options_bp:,.2f}\n"
             f"Day P/L ${day_pl:+,.2f} | Unrealized ${unrealized_total:+,.2f} | "
             f"Realized today ${realized_today:+,.2f} (all-time ${realized_total:+,.2f})\n\n"
+            + dashboard + "\n\n"
             f"**Open positions: {n_pos}/{ACCOUNT['max_open_positions']}**\n"
             + ("\n".join(lines) if lines else "_None_")
             + "\n\n**Next trade**\n"
             f"Remaining options buying power ${options_bp:,.2f}\n"
             f"Max allowed risk (20% equity, capped by BP): ${max_risk_next:,.2f} "
             f"→ max premium ${max_risk_next / 100:,.2f}/share (1 contract)\n"
-            f"Can take another 9/10 today: {can_trade_txt}"
+            f"Can take another trade: {can_trade_txt}"
         )
 
         title = f"📊 {slot_label} Portfolio Report"
@@ -1107,6 +1162,172 @@ def _run_portfolio_report(slot_label: str, sent_log: str) -> None:
         )
     except Exception as exc:
         logger.error(f"Portfolio report failed: {exc}", exc_info=True)
+
+    # The daily learning summary is sent AFTER the post-market portfolio report.
+    # It has its own try/except so it can never break the portfolio report.
+    if slot_label == "Post-Market":
+        _run_daily_learning_summary()
+
+
+def _summarize_day_from_journal() -> dict:
+    """Digest today's trade journal into deduped categories for the learning
+    summary. Read-only; tolerant of malformed lines.
+
+    Returns {executed_910, failed_910, rejected, soft_blocked} where the maps are
+    {symbol: reason} keyed last-write-wins, so repeated per-scan lines collapse to
+    one entry per symbol.
+    """
+    today = datetime.now().date().isoformat()
+    try:
+        lines = [ln for ln in _JOURNAL_FILE.read_text(encoding="utf-8").splitlines()
+                 if ln.startswith(today)]
+    except Exception:
+        lines = []
+
+    executed_910, failed_910, rejected, soft_blocked = {}, {}, {}, {}
+    for ln in lines:
+        msg = ln.split(" | ", 1)[1] if " | " in ln else ln
+
+        m = re.search(r"9/10 (?:option selection failed|blocked by HARD SAFETY):\s*(.*?)\s*\|\s*(\S+)\s*$", msg)
+        if m:
+            failed_910[m.group(2)] = m.group(1).strip()
+            continue
+        m = re.match(r"EXECUTED:\s*(\S+)\s*\|.*confidence=(\d+)/10", msg)
+        if m and int(m.group(2)) >= int(FORCE_EXECUTION.get("min_confidence", 9)):
+            executed_910[m.group(1)] = f"confidence {m.group(2)}/10"
+            continue
+        m = re.match(r"REJECTED:\s*(\S+)\s*\|\s*(.*)$", msg)
+        if m:
+            rejected[m.group(1)] = m.group(2).strip()
+            continue
+        m = re.match(r"REGIME BLOCK[^:]*:\s*(\S+)\s*\|", msg) or re.match(r"EARNINGS BLOCK:\s*(\S+)\s*\|", msg)
+        if m:
+            soft_blocked[m.group(1)] = "regime/earnings block"
+    return {
+        "executed_910": executed_910,
+        "failed_910": failed_910,
+        "rejected": rejected,
+        "soft_blocked": soft_blocked,
+    }
+
+
+def _run_daily_learning_summary() -> None:
+    """End-of-day performance journal + learning digest → Discord (read-only).
+
+    Summarizes the day's entries/exits/open trades, winners/losers, blocked and
+    9/10 outcomes, day P/L and equity change, then derives non-binding lessons
+    and rule-adjustment SUGGESTIONS. It NEVER changes any rule automatically.
+    """
+    try:
+        account = get_account_status()
+        equity = float(account.get("equity") or account.get("portfolio_value") or 0)
+        last_equity = float(account.get("last_equity") or equity)
+        day_pl = round(equity - last_equity, 2)
+        realized_today = round(get_today_realized_pnl(), 2)
+
+        entered = get_trades_entered_today()
+        exited = get_trades_exited_today()
+        open_trades = get_open_trades()
+        digest = _summarize_day_from_journal()
+
+        winners = [t for t in exited if float(t.get("pnl_dollars") or 0) > 0]
+        losers = [t for t in exited if float(t.get("pnl_dollars") or 0) < 0]
+        biggest_win = max(exited, key=lambda t: float(t.get("pnl_dollars") or 0), default=None)
+        biggest_loss = min(exited, key=lambda t: float(t.get("pnl_dollars") or 0), default=None)
+
+        def _fmt_entered(rows):
+            return ", ".join(
+                f"{t.get('symbol')} {str(t.get('trade_type') or 'CALL').upper()} "
+                f"×{int(t.get('contracts') or 0)} @ ${float(t.get('entry_option_price') or 0):.2f}"
+                for t in rows
+            ) or "none"
+
+        def _fmt_exited(rows):
+            return ", ".join(
+                f"{t.get('symbol')} (${float(t.get('pnl_dollars') or 0):+,.0f}, "
+                f"{t.get('exit_reason') or 'exit'})" for t in rows
+            ) or "none"
+
+        def _fmt_map(m, limit=8):
+            items = list(m.items())[:limit]
+            extra = f" +{len(m) - limit} more" if len(m) > limit else ""
+            return ("; ".join(f"{s}: {r}" for s, r in items) + extra) if items else "none"
+
+        # ── Lessons learned (data-driven, descriptive) ──────────────────────
+        lessons = []
+        if exited:
+            wr = len(winners) / len(exited)
+            avg_w = sum(float(t.get("pnl_dollars") or 0) for t in winners) / max(len(winners), 1)
+            avg_l = sum(float(t.get("pnl_dollars") or 0) for t in losers) / max(len(losers), 1)
+            lessons.append(
+                f"Closed {len(exited)} trade(s): win rate {wr:.0%} "
+                f"({len(winners)}W/{len(losers)}L), avg win ${avg_w:+,.0f}, avg loss ${avg_l:+,.0f}."
+            )
+            if biggest_loss and (biggest_loss.get("exit_reason") == "STOP"):
+                lessons.append("Largest loss exited via STOP — risk control worked as designed.")
+        else:
+            lessons.append("No trades closed today; open positions still developing.")
+        bp_fails = [s for s, r in digest["failed_910"].items() if "buying power" in r.lower()]
+        if bp_fails:
+            lessons.append(
+                f"{len(bp_fails)} 9/10 setup(s) missed on buying power "
+                f"({', '.join(bp_fails[:6])}) — capital was the binding constraint."
+            )
+        if digest["executed_910"]:
+            lessons.append(f"{len(digest['executed_910'])} 9/10 setup(s) executed: "
+                           f"{', '.join(digest['executed_910'])}.")
+        if not entered and (digest["rejected"] or digest["failed_910"]):
+            lessons.append("All candidates filtered before fill — no new entries today.")
+
+        # ── Rule-adjustment SUGGESTIONS (never auto-applied) ────────────────
+        suggestions = []
+        if bp_fails:
+            suggestions.append("Consider freeing capital (close a target-hit position) or trimming "
+                               "per-trade size so more high-conviction 9/10 setups can fill.")
+        if exited and len(losers) > len(winners) and len(exited) >= 3:
+            suggestions.append("Loss count exceeded wins today — review entry timing / setup quality "
+                               "before loosening any gate.")
+        sel_fails = [s for s, r in digest["failed_910"].items()
+                     if any(k in r.lower() for k in ("contract", "underlying", "liquidity"))]
+        if sel_fails:
+            suggestions.append(f"{len(sel_fails)} 9/10 setup(s) failed at option selection/liquidity "
+                               f"({', '.join(sel_fails[:6])}) — review contract/liquidity criteria.")
+        if not suggestions:
+            suggestions.append("No adjustments suggested today.")
+
+        body = (
+            f"**Activity**\n"
+            f"Entered: {len(entered)} ({_fmt_entered(entered)})\n"
+            f"Exited: {len(exited)} ({_fmt_exited(exited)})\n"
+            f"Still open: {len(open_trades)} ({', '.join(t.get('symbol') for t in open_trades) or 'none'})\n\n"
+            f"**Results**\n"
+            f"Winners: {len(winners)} | Losers: {len(losers)}\n"
+            f"Biggest winner: {biggest_win.get('symbol') if biggest_win else '—'} "
+            f"(${float((biggest_win or {}).get('pnl_dollars') or 0):+,.0f})\n"
+            f"Biggest loser: {biggest_loss.get('symbol') if biggest_loss else '—'} "
+            f"(${float((biggest_loss or {}).get('pnl_dollars') or 0):+,.0f})\n"
+            f"Day P/L: ${day_pl:+,.2f} | Realized today: ${realized_today:+,.2f} | "
+            f"Equity change: ${day_pl:+,.2f}\n\n"
+            f"**9/10 outcomes**\n"
+            f"Executed: {_fmt_map(digest['executed_910'])}\n"
+            f"Failed: {_fmt_map(digest['failed_910'])}\n\n"
+            f"**Blocked setups**\n"
+            f"Rejected: {_fmt_map(digest['rejected'])}\n"
+            f"Regime/earnings: {_fmt_map(digest['soft_blocked'])}\n\n"
+            f"**Lessons learned**\n- " + "\n- ".join(lessons) + "\n\n"
+            f"**Rule-adjustment suggestions (NOT auto-applied)**\n- " + "\n- ".join(suggestions) +
+            "\n\n_No rules were changed automatically._"
+        )
+
+        color = 0x2ECC71 if day_pl >= 0 else 0xE74C3C
+        notify_portfolio_report("🧠 Daily Learning Summary", body, color=color)
+        logger.info("Daily learning summary sent")
+        _journal(
+            f"DAILY LEARNING SUMMARY | entered={len(entered)} exited={len(exited)} "
+            f"open={len(open_trades)} day_pl=${day_pl:+,.2f}"
+        )
+    except Exception as exc:
+        logger.error(f"Daily learning summary failed: {exc}", exc_info=True)
 
 
 def start(dry_run: bool) -> None:
