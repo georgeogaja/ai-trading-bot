@@ -145,23 +145,12 @@ def validate_trade(symbol: str, trade_plan: dict, account: dict, force: bool = F
                 f"{RISK_REWARD['min_to_execute']:.2f}"
             )
 
-    if max_spend <= 0:
-        return False, "Trade size estimate missing"
-
-    max_per_trade = ACCOUNT["total_capital"] * ACCOUNT["max_per_trade_pct"]
-    if max_spend > max_per_trade:
-        return False, (
-            f"Position too large: ${max_spend:.2f} exceeds "
-            f"{ACCOUNT['max_per_trade_pct'] * 100:.0f}% limit (${max_per_trade:.2f})"
-        )
-
-    # NOTE: the reserve-cash gate is NOT evaluated here. It is enforced later in
-    # place_options_trade against the ACTUAL approved spend (premium × contracts
-    # × 100), not this raw per-trade budget — so a setup whose real cost fits
-    # within the cash reserve is no longer blocked by the nominal budget.
-    if buying_power < max_spend:
-        return False, f"Buying power insufficient: ${buying_power:.2f} available"
-
+    # Budget / affordability / cash-reserve are NOT evaluated here. Sizing is
+    # referenced to ACCOUNT EQUITY in place_options_trade: a trade may risk up to
+    # MAX_LOSS['max_loss_pct_of_equity'] of equity, capped by available OPTIONS
+    # buying power. The old per-trade-budget cap, cash-reserve gate, and
+    # budget-based buying-power check are intentionally gone — they blocked
+    # trades on low cash even when the real cost was affordable.
     if open_pos >= ACCOUNT["max_open_positions"]:
         return False, f"Max positions reached: {open_pos}/{ACCOUNT['max_open_positions']}"
 
@@ -351,84 +340,79 @@ def place_options_trade(symbol: str, trade_plan: dict, account: dict, force: boo
         limit_price = round(float(mid), 2)
         logger.info(f"Limit price set from live mid for {contract_symbol}: ${limit_price}")
 
-    # ── Maximum-loss risk control (replaces the risk/reward floor) ──────────
-    # The single hard reward/risk gate: a trade's maximum possible loss — for a
-    # long option the full debit, premium × contracts × 100 — must be <=
-    # MAX_LOSS['max_loss_pct_of_equity'] of CURRENT account equity. We cap the
-    # per-trade budget at that limit so sizing can never exceed it; a setup is
-    # rejected ONLY when a single contract alone breaches the limit. Risk/reward
-    # ratio is never consulted here.
+    # ── Equity-referenced sizing (budget = total equity, not cash) ──────────
+    # The trading budget is referenced to TOTAL ACCOUNT EQUITY. A trade may risk
+    # up to MAX_LOSS['max_loss_pct_of_equity'] of equity, and may draw on the
+    # available OPTIONS buying power to do so. Cash-reserve is NOT a blocker.
+    #   max loss (long option) = premium × contracts × 100
+    #   eligible iff  max_loss <= 20% of equity  AND  cost <= options buying power
+    # Position sizing chooses contracts from: equity, max-loss allowed, premium,
+    # and available buying power.
     equity = float(
         account.get("equity")
         or account.get("portfolio_value")
         or account.get("cash")
         or ACCOUNT["total_capital"]
     )
+    cash = float(account.get("cash", 0) or 0)
+    options_bp = float(
+        account.get("options_buying_power")
+        or account.get("buying_power")
+        or 0
+    )
     max_loss_pct = float(MAX_LOSS["max_loss_pct_of_equity"])
-    max_loss_limit = round(max_loss_pct * equity, 2)
+    max_loss_allowed = round(max_loss_pct * equity, 2)
 
-    # Size the order from the dollar budget, but never above the max-loss limit.
-    # One contract = 100 shares of premium exposure. HARD_RULES['max_contracts']
-    # is an optional ceiling (0 = unlimited). The volume-tier reduction is already
-    # baked into max_to_spend.
-    budget = min(float(plan.get("max_to_spend", 0) or 0), max_loss_limit)
     per_contract_cost = limit_price * 100
     if per_contract_cost <= 0:
         return {"success": False, "reason": "Invalid option price for contract sizing"}
-    qty = int(budget // per_contract_cost)
+
+    # Budget = max loss allowed (equity-based), capped by options buying power.
+    budget = min(max_loss_allowed, options_bp)
     contract_ceiling = int(HARD_RULES.get("max_contracts", 0) or 0)
+    qty = int(budget // per_contract_cost)
     if contract_ceiling > 0:
         qty = min(qty, contract_ceiling)
     qty = max(0, qty)
-    if qty < 1:
-        # 9/10 one-contract rule: a high-conviction (force) setup still gets a
-        # single lot when the (max-loss-capped) budget can't cover one contract —
-        # but ONLY if that one contract's full cost is itself within the max-loss
-        # limit (20% of equity), the only hard reward/risk control.
-        if force and contract_ceiling != 1 and 0 < per_contract_cost <= max_loss_limit:
-            qty = 1
-            logger.info(
-                f"9/10 one-contract rule | {symbol} | 1 contract ${per_contract_cost:,.2f} "
-                f"within max-loss limit ${max_loss_limit:,.2f} "
-                f"({max_loss_pct:.0%} of equity ${equity:,.2f}) → placing 1 contract"
-            )
-        else:
-            reason = (
-                f"Max loss ${per_contract_cost:,.2f} for 1 contract exceeds "
-                f"{max_loss_pct:.0%} of equity ${equity:,.2f} (limit ${max_loss_limit:,.2f})"
-            )
-            logger.warning(f"Trade rejected: {symbol} | {reason}")
-            return {"success": False, "reason": reason}
+    # 9/10 one-contract rule: still place a single lot when the budget can't
+    # cover one contract, provided that lot fits BOTH the max-loss limit and
+    # buying power (i.e. is within the combined budget).
+    if qty < 1 and force and contract_ceiling != 1 and 0 < per_contract_cost <= budget:
+        qty = 1
+    total_premium_cost = round(qty * per_contract_cost, 2)
 
-    # Defensive final guard: actual max loss must never exceed the limit.
-    actual_max_loss = round(qty * per_contract_cost, 2)
-    if actual_max_loss > max_loss_limit:
-        reason = (
-            f"Max loss ${actual_max_loss:,.2f} ({qty} contract(s)) exceeds "
-            f"{max_loss_pct:.0%} of equity ${equity:,.2f} (limit ${max_loss_limit:,.2f})"
-        )
-        logger.warning(f"Trade rejected: {symbol} | {reason}")
-        return {"success": False, "reason": reason}
-
-    # ── Reserve-cash gate (against the ACTUAL approved spend) ───────────────
-    # Evaluate cash − actual_trade_cost ≥ reserve, using the spend the sizing
-    # engine just approved (premium × contracts × 100), NOT the raw per-trade
-    # budget. A 9/10 whose real cost fits within the reserve now passes.
-    reserve_cash = round(ACCOUNT["total_capital"] * ACCOUNT["reserve_cash_pct"], 2)
-    cash_now = float(account.get("cash", 0) or 0)
-    if cash_now - actual_max_loss < reserve_cash:
-        reason = (
-            f"Insufficient cash after reserve: actual cost ${actual_max_loss:,.2f} "
-            f"would leave ${cash_now - actual_max_loss:,.2f} < reserve ${reserve_cash:,.2f}"
-        )
-        logger.warning(f"Trade rejected: {symbol} | {reason}")
-        return {"success": False, "reason": reason}
-
+    # Detailed decision log (always emitted, before approve/reject).
     logger.info(
-        f"Sizing {symbol}: {qty} contract(s) @ ${limit_price:.2f} "
-        f"= ${actual_max_loss:,.2f} actual cost | max-loss limit ${max_loss_limit:,.2f} "
-        f"({max_loss_pct:.0%} equity) | leaves ${cash_now - actual_max_loss:,.2f} cash "
-        f"(reserve ${reserve_cash:,.2f})"
+        f"SIZING {symbol} | equity=${equity:,.2f} | options_buying_power=${options_bp:,.2f} "
+        f"| cash=${cash:,.2f} | max_loss_allowed=${max_loss_allowed:,.2f} "
+        f"({max_loss_pct:.0%} of equity) | premium=${limit_price:.2f} "
+        f"(${per_contract_cost:,.2f}/contract) | qty={qty} | total_cost=${total_premium_cost:,.2f}"
+    )
+
+    # Hard gate 1 — max loss must be within 20% of equity (main risk rule).
+    if per_contract_cost > max_loss_allowed:
+        reason = (
+            f"Max loss ${per_contract_cost:,.2f} for 1 contract exceeds "
+            f"{max_loss_pct:.0%} of equity ${equity:,.2f} (limit ${max_loss_allowed:,.2f})"
+        )
+        logger.warning(f"REJECT {symbol} | {reason}")
+        return {"success": False, "reason": reason}
+
+    # Hard gate 2 — buying power must allow the cost (Alpaca options BP).
+    if qty < 1 or total_premium_cost > options_bp:
+        reason = (
+            f"Cost ${max(total_premium_cost, per_contract_cost):,.2f} exceeds available "
+            f"options buying power ${options_bp:,.2f}"
+        )
+        logger.warning(f"REJECT {symbol} | {reason}")
+        return {"success": False, "reason": reason}
+
+    actual_max_loss = total_premium_cost
+    logger.info(
+        f"APPROVED {symbol} | {qty} contract(s) @ ${limit_price:.2f} = "
+        f"${total_premium_cost:,.2f} total premium cost | max loss "
+        f"${actual_max_loss:,.2f} <= 20% equity ${max_loss_allowed:,.2f} | "
+        f"options buying power ${options_bp:,.2f} OK"
     )
 
     order_result = place_option_order(contract_symbol, qty, limit_price)

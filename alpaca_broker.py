@@ -76,7 +76,14 @@ def get_account_status() -> dict:
             "account_status": account.status,
             "cash": float(account.cash),
             "portfolio_value": float(account.portfolio_value),
+            "equity": float(getattr(account, "equity", account.portfolio_value)),
             "buying_power": float(account.buying_power),
+            # Long options are paid from cash, so Alpaca's OPTIONS buying power
+            # (≈ cash / non-marginable BP) is the real affordability limit — the
+            # general margin buying_power overstates what an option order can use.
+            "options_buying_power": float(
+                getattr(account, "options_buying_power", None) or account.cash
+            ),
             "open_positions": len(positions),
             "positions": [
                 {
