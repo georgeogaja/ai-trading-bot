@@ -17,7 +17,7 @@ ACCOUNT = {
                                              # checks cash — so this tracks real spendable capital)
     "max_per_trade_pct":          0.40,      # Max 40% per trade = $2,000 max deployed
     "max_open_positions":         5,         # Never more than 5 concurrent positions
-    "reserve_cash_pct":           0.20,      # Always keep 20% cash reserve = $1,000
+    "reserve_cash_pct":           0.10,      # Always keep 10% cash reserve = $500
     "paper_trading":              True,      # ALWAYS start in paper mode
     "kill_switch_enabled":        True,      # Enable daily loss and trade count protection
     "max_daily_loss_usd":         1000,      # Stop new trades after this much realized loss in a day
