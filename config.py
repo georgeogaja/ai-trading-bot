@@ -145,11 +145,15 @@ SIGNAL_WEIGHTS = {
     # Execution threshold for LONG/CALL setups. A setup is eligible to be sent to
     # the AI + executor when bull_score >= this AND it still clears the SAME
     # quality gates as an A+ LONG (BULL bias, RSI <= rsi_ideal_max, ADX >=
-    # adx_trend_min). Lowering this from 8 to 7 lets strong-but-not-A+ setups
-    # trade; every downstream control (AI confidence >= min_confidence_to_execute,
-    # volume tier, risk/reward floors, regime, sector, zone, liquidity, sizing,
-    # kill switch) is unchanged. Set back to 8 to restrict execution to A+ only.
-    "min_score_to_trade_long": 7,
+    # adx_trend_min). Lowered to 6 so a TREND-CONFIRMED 6/10 (BULL bias + ADX
+    # above adx_trend_min + RSI in range) can execute. The trend-confirmation
+    # gates are intentionally KEPT: a 6 that is trendless (ADX < adx_trend_min)
+    # or non-BULL bias still only watches — e.g. a NEUTRAL-bias, ADX ~12 name
+    # like XOM does NOT qualify. Every downstream control (AI confidence >=
+    # min_confidence_to_execute, volume tier, risk/reward floors, regime, sector,
+    # zone, liquidity, sizing, kill switch) is unchanged. Raise to 7/8 to
+    # restrict execution to strong/A+ setups only.
+    "min_score_to_trade_long": 6,
 
     # BEAR conditions
     "bias_bear":            2,

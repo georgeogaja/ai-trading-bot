@@ -10,20 +10,81 @@ import json
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from anthropic import Anthropic
 import yfinance as yf
 import ta
 from loguru import logger
-from config import ACCOUNT, HARD_RULES, PUT_SUPPORT, SIGNAL_WEIGHTS
+from config import ACCOUNT, HARD_RULES, PUT_SUPPORT, SIGNAL_WEIGHTS, ET_TIMEZONE
 from db import get_active_watchlist, get_mistake_patterns, log_signal
-
-claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+from ai_client import get_claude_client, log_fallback_mode
 
 
 # ─────────────────────────────────────────────────────────────
 # TECHNICAL INDICATOR CALCULATIONS
 # Mirrors George's ThinkorSwim script exactly
 # ─────────────────────────────────────────────────────────────
+
+def _rth_session_elapsed_fraction(bar_timestamp) -> float:
+    """Fraction in (0, 1] of the regular-hours session (09:30–16:00 ET) elapsed
+    *right now* for the given daily bar.
+
+    Returns 1.0 — i.e. "treat as a complete session, do not project" — whenever:
+      • the bar is not today's (it is an already-closed prior session), or
+      • the current time is before the open or at/after the close.
+    Returns a value in (0, 1) only while today's RTH session is in progress, so
+    callers know the latest bar's volume is still accumulating. The fraction is
+    floored so a few prints right after the open can't scale to an implausible
+    full-day estimate. Fails safe to 1.0 (no projection) on any error.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo(ET_TIMEZONE))
+    except Exception:
+        return 1.0
+
+    bar_date = getattr(bar_timestamp, "date", lambda: None)()
+    if bar_date != now.date():
+        return 1.0  # latest bar is a completed prior session
+
+    open_t  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_t = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    if now <= open_t or now >= close_t:
+        return 1.0  # outside RTH → today's bar is (effectively) complete
+
+    total_secs   = (close_t - open_t).total_seconds()
+    elapsed_secs = (now - open_t).total_seconds()
+    return max(0.15, min(1.0, elapsed_secs / total_secs))
+
+
+def _adjust_latest_volume_ratio(df: pd.DataFrame) -> None:
+    """Make the latest bar's VOL_ratio an apples-to-apples figure.
+
+    yfinance's most recent daily bar is the *in-progress* session while the
+    market is open: its cumulative volume is only partial, so dividing it by a
+    full-day 50-day average understates relative volume the entire session (the
+    raw ratio only approaches the truth at the close). When the latest bar is a
+    live session we instead compare a TIME-PROJECTED full-day volume estimate
+    against the average of the 50 COMPLETED sessions before it. Outside market
+    hours the latest bar is already complete and this is a no-op.
+
+    Mutates df['VOL_ratio'] (and df['VOL_avg50']) for the final row in place.
+    """
+    if df is None or len(df) < 51:
+        return
+
+    frac = _rth_session_elapsed_fraction(df.index[-1])
+    if frac >= 1.0:
+        return  # completed session — nothing to project
+
+    completed_avg = df['Volume'].iloc[-51:-1].mean()  # 50 sessions before today
+    if pd.isna(completed_avg) or completed_avg <= 0:
+        return
+
+    partial_volume   = float(df['Volume'].iloc[-1])
+    projected_volume = partial_volume / frac
+    last = df.index[-1]
+    df.at[last, 'VOL_avg50'] = completed_avg
+    df.at[last, 'VOL_ratio'] = round(projected_volume / completed_avg, 4)
+
 
 def calculate_indicators(symbol: str, period: str = "6mo") -> pd.DataFrame:
     """
@@ -66,6 +127,12 @@ def calculate_indicators(symbol: str, period: str = "6mo") -> pd.DataFrame:
         # Volume analysis
         df['VOL_avg50'] = df['Volume'].rolling(window=50).mean()
         df['VOL_ratio'] = df['Volume'] / df['VOL_avg50']
+        # The latest daily bar may be today's still-open session (partial
+        # cumulative volume); rescale its relative-volume figure to a full-session,
+        # apples-to-apples comparison so intraday scans don't systematically
+        # under-read volume (which both starves the A+ volume points and fails the
+        # watch-mode relative-volume test).
+        _adjust_latest_volume_ratio(df)
 
         # MACD (bonus indicator)
         macd = ta.trend.MACD(df['Close'])
@@ -239,6 +306,30 @@ def calculate_signal_scores(row: pd.Series, divergence: str, falling_wedge: bool
     return min(bull, 10), min(bear, 10), put_score
 
 
+def get_days_to_earnings(symbol: str) -> int | None:
+    """Calendar days until the next earnings date, or None if unknown.
+
+    Uses yfinance's `.calendar` (no lxml dependency). Fail-open by design: any
+    error or missing data returns None so callers never block a trade on bad or
+    absent earnings data — only a positively-known, near date should gate.
+    """
+    try:
+        cal = yf.Ticker(symbol).calendar or {}
+        dates = cal.get("Earnings Date")
+        if not dates:
+            return None
+        if not isinstance(dates, (list, tuple)):
+            dates = [dates]
+        today = datetime.now().date()
+        upcoming = [d for d in dates if d and d >= today]
+        if not upcoming:
+            return None
+        return (min(upcoming) - today).days
+    except Exception as exc:
+        logger.debug(f"Earnings date unavailable for {symbol}: {exc}")
+        return None
+
+
 def generate_signal(bull_score: int, bear_score: int, rsi: float, bias: str, adx: float) -> str:
     """
     Final signal matching George's ThinkorSwim output:
@@ -268,20 +359,25 @@ def estimate_swing_option_plan(symbol: str, row: pd.Series, signal: str) -> dict
     atr   = float(row.get('ATR', price * 0.03)) if not pd.isna(row.get('ATR', np.nan)) else price * 0.03
     expiry_date = (datetime.now() + timedelta(days=HARD_RULES['options_expiry_days'])).strftime("%Y-%m-%d")
 
+    # Keep strikes near the money (higher delta → higher probability the position
+    # finishes in profit). Capped at HARD_RULES['max_strike_pct_otm'] and floored
+    # at ~1% so we never reach for far-OTM lottos. Staying near ATM (rather than
+    # ITM) keeps a single contract inside the per-trade dollar cap.
+    otm_cap = HARD_RULES.get('max_strike_pct_otm', 0.05)
     if signal in ("A+ LONG", "LONG"):
         option_type = "CALL"
-        strike_pct = min(0.10, max(0.02, 0.04 + (rsi - HARD_RULES['rsi_ideal_min']) / 180))
+        strike_pct = min(otm_cap, max(0.01, 0.02 + (rsi - HARD_RULES['rsi_ideal_min']) / 360))
         strike = round(price * (1 + strike_pct), 2)
         stop_loss = round(max(price - atr * HARD_RULES['stop_loss_atr_multiplier'], row.get('support_20', price * 0.95)), 2)
     elif signal in ("A+ SHORT", "SHORT"):
         option_type = "PUT"
-        strike_pct = min(0.10, max(0.02, 0.04 + (HARD_RULES['rsi_overbought'] - rsi) / 180))
+        strike_pct = min(otm_cap, max(0.01, 0.02 + (HARD_RULES['rsi_overbought'] - rsi) / 360))
         strike = round(price * (1 - strike_pct), 2)
         stop_loss = round(min(price + atr * HARD_RULES['stop_loss_atr_multiplier'], row.get('resistance_20', price * 1.05)), 2)
     else:
         option_type = "CALL"
-        strike_pct = 0.05
-        strike = round(price * 1.05, 2)
+        strike_pct = min(otm_cap, 0.03)
+        strike = round(price * (1 + strike_pct), 2)
         stop_loss = round(price - atr * HARD_RULES['stop_loss_atr_multiplier'], 2)
 
     return {
@@ -392,6 +488,23 @@ def analyze_stock(symbol: str) -> dict:
     if qualifies_aplus_put and PUT_SUPPORT.get("require_downside_momentum", True):
         qualifies_aplus_put = qualifies_aplus_put and di_minus > di_plus
 
+    # ── LONG/CALL execution eligibility ───────────────────────
+    # Mirrors the A+ LONG quality gates (BULL bias, RSI <= ideal max, ADX >=
+    # trend min) but uses the configurable execution score threshold
+    # (min_score_to_trade_long, currently 6) instead of the A+ label score (8).
+    # This is what routes a setup to the AI/executor; the "A+ LONG" label itself
+    # is unchanged and still requires a full 8. The quality gates are KEPT, so a
+    # TREND-CONFIRMED 6 (BULL bias + ADX >= trend min + RSI in range) now trades,
+    # while an extended (RSI > ideal max) or trendless (ADX < min) / non-BULL 6
+    # still only watches.
+    qualifies_trade_long = (
+        signal in ("A+ LONG", "LONG")
+        and bias == "BULL"
+        and rsi <= HARD_RULES["rsi_ideal_max"]
+        and adx >= HARD_RULES["adx_trend_min"]
+        and bull >= SIGNAL_WEIGHTS["min_score_to_trade_long"]
+    )
+
     # Format exactly like George's ThinkorSwim label
     signal_bar = (
         f"BIAS: {bias} | RSI {rsi} | ADX {adx} | "
@@ -426,6 +539,7 @@ def analyze_stock(symbol: str) -> dict:
         "high_52wk":        high_52wk,
         "signal_bar":       signal_bar,
         "qualifies_aplus":  signal == "A+ LONG" and rsi < HARD_RULES["rsi_overbought"],
+        "qualifies_trade_long": qualifies_trade_long,
         "qualifies_aplus_put": qualifies_aplus_put,
         "suggested_option": option_plan,
     }
@@ -461,16 +575,80 @@ def merge_trade_plan_with_suggestion(claude_result: dict, suggested_option: dict
 
 
 # ─────────────────────────────────────────────────────────────
-# CLAUDE TRADE DECISION ENGINE
+# TRADE DECISION ENGINE (deterministic core, optional AI overlay)
 # ─────────────────────────────────────────────────────────────
+
+def deterministic_trade_plan(symbol: str, technical: dict) -> dict:
+    """Rule-based trade decision used when AI is unavailable.
+
+    This is the deterministic core of the bot. `run_full_scan` only calls into
+    the decision engine for setups that have ALREADY cleared the qualification
+    and quality gates (qualifies_trade_long / qualifies_aplus_put), so a
+    qualified setup here is a TRADE. Confidence comes straight from the
+    rule-based signal score (bull for longs, bear for PUTs), which is on the
+    same 1–10 scale as ACCOUNT['min_confidence_to_execute'] — so the downstream
+    confidence gate, regime bump, volume/risk and liquidity controls all keep
+    working unchanged with no AI in the loop.
+
+    The returned trade_plan is the internal swing-option plan; downstream
+    `merge_trade_plan_with_suggestion` fills any gaps from the same suggested
+    plan, so the shape matches the AI path exactly.
+    """
+    suggested = technical.get("suggested_option", {}) or {}
+    is_put = str(suggested.get("option_type", "CALL")).upper() == "PUT"
+    base_score = technical.get("bear_score" if is_put else "bull_score", 0) or 0
+    confidence = int(max(1, min(10, base_score)))
+    direction = "bearish PUT" if is_put else "bullish CALL"
+
+    thesis = (
+        f"Deterministic {direction} setup on {symbol}: signal "
+        f"{technical.get('signal')}, RSI {technical.get('rsi')}, "
+        f"ADX {technical.get('adx')}, bias {technical.get('bias')}, "
+        f"vol {technical.get('vol_ratio')}x, R/R "
+        f"{technical.get('risk_reward_ratio')}. Qualified by the rule-based "
+        f"engine (AI commentary unavailable)."
+    )
+
+    plan = dict(suggested)
+    plan["thesis"] = thesis
+    plan["catalyst"] = suggested.get("catalyst", "Rule-based technical setup")
+    plan["pattern"] = suggested.get("pattern", "rule-based swing setup")
+
+    return {
+        "decision": "TRADE",
+        "confidence": confidence,
+        "reason": (
+            "Deterministic fallback (AI unavailable): setup met all rule-based "
+            "A+/strong criteria — proceeding on technicals and risk controls."
+        ),
+        "skip_reason": "",
+        "trade_plan": plan,
+        "mistake_risk": "",
+        "lessons_applied": "Deterministic engine — no AI lesson review.",
+    }
+
 
 def get_claude_trade_plan(symbol: str, technical: dict, macro: dict,
                            account_info: dict) -> dict:
     """
-    Sends full context to Claude and gets a complete trade plan.
-    Claude applies George's strategy, recent mistake patterns, and
-    optional live Perplexity research to make the final decision.
+    Returns a complete trade plan for a qualified setup.
+
+    Deterministic-first: when no Claude client is available (no API key, SDK
+    missing, or a runtime API failure) the bot falls back to
+    `deterministic_trade_plan` so scanning, ranking and paper-trade execution
+    continue uninterrupted. When a client IS available, Claude refines the
+    decision using George's strategy, recent mistake patterns, and optional
+    live Perplexity research — a purely additive overlay on the rule-based core.
     """
+    client = get_claude_client()
+    if client is None:
+        log_fallback_mode()
+        plan = deterministic_trade_plan(symbol, technical)
+        logger.info(
+            f"Deterministic decision for {symbol}: {plan['decision']} "
+            f"(confidence {plan['confidence']}/10) — AI unavailable"
+        )
+        return plan
 
     # Get recent mistake patterns to inform the decision
     mistakes = get_mistake_patterns(days_back=30)
@@ -629,16 +807,28 @@ RESPOND WITH VALID JSON ONLY:
 }}
 """
 
-    response = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}]
-    )
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+    except Exception as exc:
+        # AI became unavailable at call time (network/auth/rate limit). Do NOT
+        # drop the setup — fall back to the deterministic decision so execution
+        # continues exactly as it would with no key configured.
+        logger.warning(
+            f"Claude call failed for {symbol}: {exc} — using deterministic fallback"
+        )
+        log_fallback_mode(str(exc))
+        return deterministic_trade_plan(symbol, technical)
 
     try:
         result = json.loads(response.content[0].text)
         return result
     except json.JSONDecodeError:
+        # The AI responded but the JSON was malformed. This is a bad AI answer,
+        # not AI being unavailable, so stay conservative and SKIP.
         return {"decision": "SKIP", "reason": "Claude response parse error"}
 
 
@@ -682,12 +872,15 @@ def run_full_scan(macro: dict, account_info: dict) -> dict:
             # Print the ThinkorSwim-style signal bar for every stock
             print(f"  {symbol:6s}: {technical.get('signal_bar', 'ERROR')}")
 
-            # Only proceed to Claude decision for A+ LONG signals
+            # Proceed to Claude decision for any LONG/CALL setup that clears the
+            # execution threshold (bull >= min_score_to_trade_long) and the A+
+            # quality gates. A+ LONGs (score 8) are a strict subset of this, so
+            # this single branch covers both A+ and strong (e.g. 7/10) longs.
             macro_ok = macro.get('signal') != 'RED'
             if HARD_RULES.get('require_macro_green'):
                 macro_ok = macro.get('signal') == 'GREEN'
 
-            if technical.get('qualifies_aplus') and macro_ok:
+            if technical.get('qualifies_trade_long') and macro_ok:
                 trade_plan = get_claude_trade_plan(symbol, technical, macro, account_info)
 
                 if trade_plan.get('decision') == 'TRADE':
@@ -703,7 +896,19 @@ def run_full_scan(macro: dict, account_info: dict) -> dict:
                         "technical":  technical,
                         "trade_plan": trade_plan,
                     })
-                    logger.info(f"🚨 A+ TRADE SIGNAL: {symbol} | Confidence: {trade_plan.get('confidence')}/10")
+                    tier = "A+" if technical.get('qualifies_aplus') else "STRONG"
+                    logger.info(
+                        f"🚨 {tier} TRADE SIGNAL: {symbol} | "
+                        f"score {technical.get('bull_score')}/10 | "
+                        f"Confidence: {trade_plan.get('confidence')}/10"
+                    )
+                else:
+                    # AI declined (SKIP/WAIT) — keep the name under watch-mode
+                    # monitoring rather than dropping it entirely.
+                    watch_candidates.append({
+                        "symbol":    symbol,
+                        "technical": technical,
+                    })
 
             # ── Bearish PUT path (Phase 3B) ───────────────────
             # A confirmed A+ SHORT goes to Claude exactly like a CALL setup.
