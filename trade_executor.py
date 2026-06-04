@@ -7,7 +7,7 @@ Handles options order placement, position sizing, stop loss, profit targets, and
 import yfinance as yf
 from datetime import datetime
 from loguru import logger
-from config import ACCOUNT, FORCE_EXECUTION, HARD_RULES, OPTIONS_LIQUIDITY, POSITION_SIZING, RISK_REWARD
+from config import ACCOUNT, FORCE_EXECUTION, HARD_RULES, MAX_LOSS, OPTIONS_LIQUIDITY, POSITION_SIZING, RISK_REWARD
 from db import (
     log_trade_entry,
     update_trade_exit,
@@ -128,19 +128,16 @@ def validate_trade(symbol: str, trade_plan: dict, account: dict, force: bool = F
                 f"{POSITION_SIZING['volume_reduced_min']:.2f}x — watch only"
             )
 
-    # Risk/reward gates — absolute floor first (HARD, never bypassed), then the
-    # standard minimum (SOFT: a 9/10 may proceed if it is above the hard floor).
-    if risk_reward < RISK_REWARD["hard_floor"]:
-        return False, (
-            f"Risk/reward {risk_reward:.2f} below absolute floor "
-            f"{RISK_REWARD['hard_floor']:.2f} — never trade"
-        )
+    # Risk/reward is NO LONGER a hard control. The absolute floor was removed in
+    # favor of the MAX_LOSS model (enforced at sizing in place_options_trade).
+    # R/R remains only a SOFT quality gate for NON-force setups; a 9/10 force
+    # setup bypasses it entirely and is NEVER blocked on risk/reward.
     if risk_reward < RISK_REWARD["min_to_execute"]:
         if force:
             logger.info(
                 f"Soft gate bypassed due to 9/10 | {symbol} | risk/reward "
                 f"{risk_reward:.2f} below minimum {RISK_REWARD['min_to_execute']:.2f} "
-                f"(above hard floor {RISK_REWARD['hard_floor']:.2f})"
+                f"— R/R does not block a 9/10 (max-loss model governs)"
             )
         else:
             return False, (
@@ -354,12 +351,27 @@ def place_options_trade(symbol: str, trade_plan: dict, account: dict, force: boo
         limit_price = round(float(mid), 2)
         logger.info(f"Limit price set from live mid for {contract_symbol}: ${limit_price}")
 
-    # Size the order from the dollar budget — buy as many contracts as the
-    # per-trade spend allows (one contract = 100 shares of premium exposure).
-    # HARD_RULES['max_contracts'] is an optional safety ceiling (0 = unlimited).
-    # The volume-tier reduction above is already baked into max_to_spend, so a
-    # reduced tier naturally lands on fewer contracts.
-    budget = float(plan.get("max_to_spend", 0) or 0)
+    # ── Maximum-loss risk control (replaces the risk/reward floor) ──────────
+    # The single hard reward/risk gate: a trade's maximum possible loss — for a
+    # long option the full debit, premium × contracts × 100 — must be <=
+    # MAX_LOSS['max_loss_pct_of_equity'] of CURRENT account equity. We cap the
+    # per-trade budget at that limit so sizing can never exceed it; a setup is
+    # rejected ONLY when a single contract alone breaches the limit. Risk/reward
+    # ratio is never consulted here.
+    equity = float(
+        account.get("equity")
+        or account.get("portfolio_value")
+        or account.get("cash")
+        or ACCOUNT["total_capital"]
+    )
+    max_loss_pct = float(MAX_LOSS["max_loss_pct_of_equity"])
+    max_loss_limit = round(max_loss_pct * equity, 2)
+
+    # Size the order from the dollar budget, but never above the max-loss limit.
+    # One contract = 100 shares of premium exposure. HARD_RULES['max_contracts']
+    # is an optional ceiling (0 = unlimited). The volume-tier reduction is already
+    # baked into max_to_spend.
+    budget = min(float(plan.get("max_to_spend", 0) or 0), max_loss_limit)
     per_contract_cost = limit_price * 100
     if per_contract_cost <= 0:
         return {"success": False, "reason": "Invalid option price for contract sizing"}
@@ -369,40 +381,38 @@ def place_options_trade(symbol: str, trade_plan: dict, account: dict, force: boo
         qty = min(qty, contract_ceiling)
     qty = max(0, qty)
     if qty < 1:
-        # 9/10 one-contract rule: a high-conviction (force) setup should still
-        # get a single lot even when the per-trade budget alone can't cover one
-        # contract — BUT only if that one contract fits within (cash − reserve),
-        # so the cash reserve is never breached. This intentionally allows a
-        # 1-lot to exceed the max_per_trade_pct cap, and nothing else: 2+ lots
-        # still obey the budget. Non-force setups keep the strict budget.
-        if force and contract_ceiling != 1:  # respect an explicit 1-contract hard ceiling
-            cash = float(account.get("cash", 0) or 0)
-            reserve = ACCOUNT["total_capital"] * ACCOUNT["reserve_cash_pct"]
-            spendable_after_reserve = cash - reserve
-            if 0 < per_contract_cost <= spendable_after_reserve:
-                qty = 1
-                logger.info(
-                    f"9/10 one-contract rule | {symbol} | budget ${budget:,.0f} can't cover "
-                    f"1 contract (${per_contract_cost:,.0f}), but it fits within cash−reserve "
-                    f"(${spendable_after_reserve:,.0f}) → placing 1 contract"
-                )
-            else:
-                reason = (
-                    f"9/10 one contract ${per_contract_cost:,.0f} exceeds cash after reserve "
-                    f"${spendable_after_reserve:,.0f} — cannot place without breaching reserve"
-                )
-                logger.warning(f"Trade rejected: {symbol} | {reason}")
-                return {"success": False, "reason": reason}
+        # 9/10 one-contract rule: a high-conviction (force) setup still gets a
+        # single lot when the (max-loss-capped) budget can't cover one contract —
+        # but ONLY if that one contract's full cost is itself within the max-loss
+        # limit (20% of equity), the only hard reward/risk control.
+        if force and contract_ceiling != 1 and 0 < per_contract_cost <= max_loss_limit:
+            qty = 1
+            logger.info(
+                f"9/10 one-contract rule | {symbol} | 1 contract ${per_contract_cost:,.2f} "
+                f"within max-loss limit ${max_loss_limit:,.2f} "
+                f"({max_loss_pct:.0%} of equity ${equity:,.2f}) → placing 1 contract"
+            )
         else:
             reason = (
-                f"Contract too expensive for budget: 1 contract ${per_contract_cost:,.0f} "
-                f"exceeds max spend ${budget:,.0f}"
+                f"Max loss ${per_contract_cost:,.2f} for 1 contract exceeds "
+                f"{max_loss_pct:.0%} of equity ${equity:,.2f} (limit ${max_loss_limit:,.2f})"
             )
             logger.warning(f"Trade rejected: {symbol} | {reason}")
             return {"success": False, "reason": reason}
+
+    # Defensive final guard: actual max loss must never exceed the limit.
+    actual_max_loss = round(qty * per_contract_cost, 2)
+    if actual_max_loss > max_loss_limit:
+        reason = (
+            f"Max loss ${actual_max_loss:,.2f} ({qty} contract(s)) exceeds "
+            f"{max_loss_pct:.0%} of equity ${equity:,.2f} (limit ${max_loss_limit:,.2f})"
+        )
+        logger.warning(f"Trade rejected: {symbol} | {reason}")
+        return {"success": False, "reason": reason}
     logger.info(
         f"Sizing {symbol}: {qty} contract(s) @ ${limit_price:.2f} "
-        f"= ${qty * per_contract_cost:,.0f} of ${budget:,.0f} budget"
+        f"= ${actual_max_loss:,.2f} max loss (limit ${max_loss_limit:,.2f}, "
+        f"{max_loss_pct:.0%} of equity ${equity:,.2f})"
     )
 
     order_result = place_option_order(contract_symbol, qty, limit_price)

@@ -45,9 +45,26 @@ POSITION_SIZING = {
 # ─────────────────────────────────────────────────────────────
 # RISK / REWARD GATES
 # ─────────────────────────────────────────────────────────────
+# Risk/reward is NO LONGER a hard control. The absolute floor was replaced by the
+# MAX_LOSS model below. R/R remains only a SOFT quality hint for non-9/10 setups;
+# a 9/10 force-execution setup is NEVER blocked on risk/reward (any ratio is fine).
 RISK_REWARD = {
-    "min_to_execute":   1.80,   # Standard minimum risk/reward required to place a new trade
-    "hard_floor":       1.50,   # Absolute floor — never trade below this under any condition
+    "min_to_execute":   1.80,   # Soft: a NON-force setup below this only watches.
+                                # Force (9/10) setups bypass this entirely.
+}
+
+# ─────────────────────────────────────────────────────────────
+# MAXIMUM-LOSS RISK MODEL  (the single hard reward/risk control)
+# A trade's maximum possible loss must not exceed this fraction of CURRENT account
+# equity. For a long option the max loss is the full debit paid:
+#       max_loss = premium × contracts × 100
+# The per-trade budget is capped at (max_loss_pct_of_equity × equity), so sizing
+# can never exceed the limit; a setup is rejected only when even ONE contract would
+# breach it. Risk/reward ratio is never consulted for the execution decision.
+#   equity $5,000 → limit $1,000 :  $700 ✓ allow | $950 ✓ allow | $1,050 ✗ reject
+# ─────────────────────────────────────────────────────────────
+MAX_LOSS = {
+    "max_loss_pct_of_equity": 0.20,   # Max loss per trade <= 20% of account equity
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -60,7 +77,7 @@ RISK_REWARD = {
 #   - sector not strongest
 #   - missing / misaligned TradingView supply-demand zone
 #   - AI unavailable (deterministic fallback)
-#   - borderline risk/reward, as long as it is above RISK_REWARD['hard_floor']
+#   - borderline risk/reward (R/R never blocks a 9/10; the MAX_LOSS cap governs)
 # HARD safety controls are ALWAYS enforced, even for a 9/10 (see validate_trade
 # and place_options_trade): paper-only, kill switch, max daily loss, max trades
 # per day, max open positions, buying power, reserve cash, position-size cap,
