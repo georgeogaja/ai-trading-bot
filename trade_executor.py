@@ -155,10 +155,10 @@ def validate_trade(symbol: str, trade_plan: dict, account: dict, force: bool = F
             f"{ACCOUNT['max_per_trade_pct'] * 100:.0f}% limit (${max_per_trade:.2f})"
         )
 
-    reserve = ACCOUNT["total_capital"] * ACCOUNT["reserve_cash_pct"]
-    if cash - max_spend < reserve:
-        return False, f"Insufficient cash after reserve: would leave ${cash - max_spend:.2f}"
-
+    # NOTE: the reserve-cash gate is NOT evaluated here. It is enforced later in
+    # place_options_trade against the ACTUAL approved spend (premium × contracts
+    # × 100), not this raw per-trade budget — so a setup whose real cost fits
+    # within the cash reserve is no longer blocked by the nominal budget.
     if buying_power < max_spend:
         return False, f"Buying power insufficient: ${buying_power:.2f} available"
 
@@ -409,10 +409,26 @@ def place_options_trade(symbol: str, trade_plan: dict, account: dict, force: boo
         )
         logger.warning(f"Trade rejected: {symbol} | {reason}")
         return {"success": False, "reason": reason}
+
+    # ── Reserve-cash gate (against the ACTUAL approved spend) ───────────────
+    # Evaluate cash − actual_trade_cost ≥ reserve, using the spend the sizing
+    # engine just approved (premium × contracts × 100), NOT the raw per-trade
+    # budget. A 9/10 whose real cost fits within the reserve now passes.
+    reserve_cash = round(ACCOUNT["total_capital"] * ACCOUNT["reserve_cash_pct"], 2)
+    cash_now = float(account.get("cash", 0) or 0)
+    if cash_now - actual_max_loss < reserve_cash:
+        reason = (
+            f"Insufficient cash after reserve: actual cost ${actual_max_loss:,.2f} "
+            f"would leave ${cash_now - actual_max_loss:,.2f} < reserve ${reserve_cash:,.2f}"
+        )
+        logger.warning(f"Trade rejected: {symbol} | {reason}")
+        return {"success": False, "reason": reason}
+
     logger.info(
         f"Sizing {symbol}: {qty} contract(s) @ ${limit_price:.2f} "
-        f"= ${actual_max_loss:,.2f} max loss (limit ${max_loss_limit:,.2f}, "
-        f"{max_loss_pct:.0%} of equity ${equity:,.2f})"
+        f"= ${actual_max_loss:,.2f} actual cost | max-loss limit ${max_loss_limit:,.2f} "
+        f"({max_loss_pct:.0%} equity) | leaves ${cash_now - actual_max_loss:,.2f} cash "
+        f"(reserve ${reserve_cash:,.2f})"
     )
 
     order_result = place_option_order(contract_symbol, qty, limit_price)
